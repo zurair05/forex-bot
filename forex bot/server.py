@@ -11,6 +11,7 @@ Install deps first (one time only):
     pip install flask flask-cors yfinance pandas numpy
 """
 
+import os
 import time
 import logging
 import webbrowser
@@ -76,6 +77,24 @@ TF_PERIOD   = {"M15": "5d",  "M30": "7d",  "H1": "30d","H4": "60d","D1": "1y"}
 
 _cache: dict = {}
 CACHE_TTL = 300  # seconds
+
+# ── Risk Config (editable via /api/config) ────────────────────────────
+RISK_CONFIG = {
+    "account_balance":   10000.0,  # USD
+    "risk_pct":          1.5,      # % per trade
+    "max_daily_dd":      5.0,      # % daily drawdown limit
+    "max_open_trades":   5,        # max simultaneous trades
+    "min_rr":            2.5,      # minimum risk:reward
+    "max_spread_pips":   2.5,      # skip if spread wider
+    "sl_pips":           20,       # stop loss in pips
+    "tp1_r":             1.5,      # TP1 multiplier (R)
+    "tp2_r":             3.0,      # TP2 multiplier (R)
+    "be_r":              1.0,      # move to breakeven after R
+    "trail_r":           1.5,      # start trailing after R
+    "min_score":         0.50,     # min confluence score to signal
+    "sessions":          ["London", "New York"],  # active sessions
+    "pairs":             ["EURUSD", "GBPUSD", "USDJPY", "GBPJPY", "AUDUSD", "XAUUSD"],
+}
 
 # ══════════════════════════════════════════════════════════════════════
 #  MARKET HOURS
@@ -389,17 +408,34 @@ def make_signal(pair: str, htf: dict, mtf: dict, ltf: dict) -> dict:
     pip    = PIP.get(pair, 0.0001)
     dp     = DIGITS.get(pair, 5)
     price  = mtf.get("price", 0)
+    cfg    = RISK_CONFIG
+
     bs, bc = score_dir(True,  htf, mtf, ltf)
     ss, sc = score_dir(False, htf, mtf, ltf)
-    if bs >= ss and bs >= 0.50:        direction, score, conf = "BUY",  bs, bc
-    elif ss > bs and ss >= 0.50:       direction, score, conf = "SELL", ss, sc
-    else:                              direction, score, conf = "WAIT", max(bs,ss), []
-    sl_d  = pip * 20
-    entry = round(price, dp)
-    sl    = round(price - sl_d if direction == "BUY" else price + sl_d, dp)
-    tp1   = round(price + sl_d*1.5 if direction == "BUY" else price - sl_d*1.5, dp)
-    tp2   = round(price + sl_d*3.0 if direction == "BUY" else price - sl_d*3.0, dp)
-    rr    = round(abs(tp1-entry)/abs(entry-sl), 2) if abs(entry-sl) > 0 else 0
+    min_score = cfg.get("min_score", 0.50)
+    if bs >= ss and bs >= min_score:        direction, score, conf = "BUY",  bs, bc
+    elif ss > bs and ss >= min_score:       direction, score, conf = "SELL", ss, sc
+    else:                                   direction, score, conf = "WAIT", max(bs,ss), []
+
+    sl_pips = cfg.get("sl_pips", 20)
+    tp1_r   = cfg.get("tp1_r", 1.5)
+    tp2_r   = cfg.get("tp2_r", 3.0)
+    sl_d    = pip * sl_pips
+    entry   = round(price, dp)
+    sl      = round(price - sl_d if direction == "BUY" else price + sl_d, dp)
+    tp1     = round(price + sl_d*tp1_r if direction == "BUY" else price - sl_d*tp1_r, dp)
+    tp2     = round(price + sl_d*tp2_r if direction == "BUY" else price - sl_d*tp2_r, dp)
+    rr      = round(abs(tp1-entry)/abs(entry-sl), 2) if abs(entry-sl) > 0 else 0
+
+    # Lot size calculation
+    balance  = cfg.get("account_balance", 10000)
+    risk_pct = cfg.get("risk_pct", 1.5)
+    risk_usd = balance * risk_pct / 100
+    pip_val  = pip * 100000  # approx per standard lot
+    if pair.endswith("JPY"): pip_val = (pip * 100000) / max(price, 1)
+    if pair == "XAUUSD":     pip_val = pip * 100
+    lots = round(risk_usd / (sl_pips * pip_val), 2) if pip_val > 0 and sl_pips > 0 else 0.01
+    lots = max(0.01, min(lots, 10.0))
 
     # Zones for frontend
     zones = []
@@ -417,11 +453,14 @@ def make_signal(pair: str, htf: dict, mtf: dict, ltf: dict) -> dict:
         zones.append({"type": lq["type"], "price": round(lq["price"],dp),
                       "status": "Target", "color": "blue"})
 
+    min_rr = cfg.get("min_rr", 2.0)
     return {
         "pair": pair, "direction": direction,
         "score": round(score,3), "score_pct": round(score*100),
         "conf": conf, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr": rr,
-        "valid": direction != "WAIT" and rr >= 2.0,
+        "lots": lots, "risk_usd": round(risk_usd, 2),
+        "sl_pips": sl_pips, "account_balance": balance,
+        "valid": direction != "WAIT" and rr >= min_rr,
         "buy_score": round(bs,3), "sell_score": round(ss,3),
         "trend": mtf.get("trend","ranging"),
         "choch": mtf.get("choch",False), "choch_dir": mtf.get("choch_dir",""),
@@ -441,6 +480,81 @@ def make_signal(pair: str, htf: dict, mtf: dict, ltf: dict) -> dict:
 @app.route("/api/health")
 def api_health():
     return jsonify({"status": "ok", "time": datetime.now(timezone.utc).isoformat()})
+
+
+@app.route("/api/config", methods=["GET"])
+def api_config_get():
+    """Return current risk configuration."""
+    return jsonify({"config": RISK_CONFIG, "timestamp": datetime.now(timezone.utc).isoformat()})
+
+
+@app.route("/api/config", methods=["POST"])
+def api_config_set():
+    """Update risk configuration. Send JSON with any fields to update."""
+    global RISK_CONFIG
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "No JSON body"}), 400
+
+    # Validate and update each field
+    allowed = {
+        "account_balance": (float, 100, 10_000_000),
+        "risk_pct":        (float, 0.1, 10.0),
+        "max_daily_dd":    (float, 1.0, 20.0),
+        "max_open_trades": (int,   1,   20),
+        "min_rr":          (float, 1.0, 10.0),
+        "max_spread_pips": (float, 0.5, 10.0),
+        "sl_pips":         (float, 5,   200),
+        "tp1_r":           (float, 0.5, 5.0),
+        "tp2_r":           (float, 1.0, 10.0),
+        "be_r":            (float, 0.5, 3.0),
+        "trail_r":         (float, 0.5, 5.0),
+        "min_score":       (float, 0.1, 1.0),
+    }
+    updated = {}
+    errors  = {}
+    for key, value in data.items():
+        if key not in allowed:
+            continue
+        typ, lo, hi = allowed[key]
+        try:
+            v = typ(value)
+            if not (lo <= v <= hi):
+                errors[key] = f"Must be {lo}–{hi}"
+                continue
+            RISK_CONFIG[key] = v
+            updated[key] = v
+        except (ValueError, TypeError):
+            errors[key] = "Invalid value"
+
+    # Update string lists separately
+    if "sessions" in data and isinstance(data["sessions"], list):
+        valid_sess = ["Sydney", "Tokyo", "London", "New York"]
+        RISK_CONFIG["sessions"] = [s for s in data["sessions"] if s in valid_sess]
+        updated["sessions"] = RISK_CONFIG["sessions"]
+    if "pairs" in data and isinstance(data["pairs"], list):
+        valid_pairs = list(PAIRS.keys())
+        RISK_CONFIG["pairs"] = [p for p in data["pairs"] if p in valid_pairs]
+        updated["pairs"] = RISK_CONFIG["pairs"]
+
+    log.info(f"Config updated: {updated}")
+    return jsonify({"updated": updated, "errors": errors, "config": RISK_CONFIG})
+
+
+@app.route("/api/config/reset", methods=["POST"])
+def api_config_reset():
+    """Reset risk config to defaults."""
+    global RISK_CONFIG
+    RISK_CONFIG = {
+        "account_balance": 10000.0, "risk_pct": 1.5, "max_daily_dd": 5.0,
+        "max_open_trades": 5, "min_rr": 2.5, "max_spread_pips": 2.5,
+        "sl_pips": 20, "tp1_r": 1.5, "tp2_r": 3.0, "be_r": 1.0,
+        "trail_r": 1.5, "min_score": 0.50,
+        "sessions": ["London", "New York"],
+        "pairs": ["EURUSD", "GBPUSD", "USDJPY", "GBPJPY", "AUDUSD", "XAUUSD"],
+    }
+    log.info("Config reset to defaults")
+    return jsonify({"message": "Reset to defaults", "config": RISK_CONFIG})
 
 
 @app.route("/api/live-prices")
@@ -679,6 +793,11 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
 .toast.tb{border-color:rgba(0,255,179,.3);background:var(--green-a)}
 .toast.ts{border-color:rgba(255,61,90,.3);background:var(--red-a)}
 .toast.tw{border-color:rgba(255,184,0,.3);background:var(--amber-a)}
+.trd-btn{font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:3px;border:0.5px solid rgba(255,255,255,0.07);background:var(--bg2);color:var(--text2);cursor:pointer;flex:1;text-align:center;transition:all .15s}
+.trd-btn.active{background:var(--blue-a);border-color:rgba(61,159,255,.3);color:var(--blue);font-weight:700}
+.sess-tog{font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;border:0.5px solid rgba(255,255,255,0.07);background:var(--bg2);color:var(--text2);cursor:pointer;transition:all .15s}
+.sess-tog.active{background:var(--green-a);border-color:rgba(0,255,179,.3);color:var(--green)}
+input[type=range]{accent-color:var(--green);height:3px}
 </style>
 </head>
 <body>
@@ -756,6 +875,116 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
       <div class="sect-label">Detected SMC Zones</div>
       <div class="zone-list" id="zoneList"><div class="zone-row"><span class="zn" style="color:var(--text3)">Scan to detect zones</span></div></div>
     </div>
+    <div class="sect" id="riskPanel">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.6rem">
+        <div class="sect-label" style="margin:0">Risk Config</div>
+        <div style="display:flex;gap:5px">
+          <button onclick="saveConfig()" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border-radius:3px;background:var(--green);color:#000;border:none;font-weight:700;cursor:pointer">SAVE</button>
+          <button onclick="resetConfig()" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;background:transparent;color:var(--text2);border:0.5px solid rgba(255,255,255,0.12);cursor:pointer">RESET</button>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:7px">
+
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px">
+            <span style="color:#2d404f;letter-spacing:.08em;text-transform:uppercase">Account Balance</span>
+            <span style="color:var(--green)" id="vBalance">0,000</span>
+          </div>
+          <input type="range" id="sBalance" min="1000" max="100000" step="1000" value="10000" oninput="updCfg()" style="width:100%">
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px">
+            <span style="color:#2d404f;letter-spacing:.08em;text-transform:uppercase">Risk Per Trade</span>
+            <span style="color:var(--amber)" id="vRisk">1.5%</span>
+          </div>
+          <input type="range" id="sRisk" min="0.1" max="5" step="0.1" value="1.5" oninput="updCfg()" style="width:100%">
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px">
+            <span style="color:#2d404f;letter-spacing:.08em;text-transform:uppercase">Max Daily DD</span>
+            <span style="color:var(--red)" id="vDD">5.0%</span>
+          </div>
+          <input type="range" id="sDD" min="1" max="15" step="0.5" value="5" oninput="updCfg()" style="width:100%">
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px">
+            <span style="color:#2d404f;letter-spacing:.08em;text-transform:uppercase">SL Pips</span>
+            <span style="color:var(--text)" id="vSL">20 pips</span>
+          </div>
+          <input type="range" id="sSL" min="5" max="100" step="1" value="20" oninput="updCfg()" style="width:100%">
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px">
+            <span style="color:#2d404f;letter-spacing:.08em;text-transform:uppercase">Min R:R</span>
+            <span style="color:var(--blue)" id="vRR">1 : 2.5</span>
+          </div>
+          <input type="range" id="sRR" min="1" max="5" step="0.1" value="2.5" oninput="updCfg()" style="width:100%">
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px">
+            <span style="color:#2d404f;letter-spacing:.08em;text-transform:uppercase">TP1 Multiplier</span>
+            <span style="color:var(--green)" id="vTP1">1.5 R</span>
+          </div>
+          <input type="range" id="sTP1" min="0.5" max="3" step="0.1" value="1.5" oninput="updCfg()" style="width:100%">
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px">
+            <span style="color:#2d404f;letter-spacing:.08em;text-transform:uppercase">TP2 Multiplier</span>
+            <span style="color:var(--green)" id="vTP2">3.0 R</span>
+          </div>
+          <input type="range" id="sTP2" min="1" max="8" step="0.1" value="3" oninput="updCfg()" style="width:100%">
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px">
+            <span style="color:#2d404f;letter-spacing:.08em;text-transform:uppercase">Min Score</span>
+            <span style="color:var(--text)" id="vScore">50%</span>
+          </div>
+          <input type="range" id="sScore" min="10" max="90" step="5" value="50" oninput="updCfg()" style="width:100%">
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px">
+            <span style="color:#2d404f;letter-spacing:.08em;text-transform:uppercase">Max Spread</span>
+            <span style="color:var(--text)" id="vSpread">2.5 pips</span>
+          </div>
+          <input type="range" id="sSpread" min="0.5" max="8" step="0.5" value="2.5" oninput="updCfg()" style="width:100%">
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <div style="font-family:var(--mono);font-size:9px;color:#2d404f;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px">Max Open Trades</div>
+          <div style="display:flex;gap:5px">
+            <button class="trd-btn active" id="tb1" onclick="setMaxTrades(1)">1</button>
+            <button class="trd-btn" id="tb2" onclick="setMaxTrades(2)">2</button>
+            <button class="trd-btn" id="tb3" onclick="setMaxTrades(3)">3</button>
+            <button class="trd-btn" id="tb5" onclick="setMaxTrades(5)">5</button>
+            <button class="trd-btn" id="tb10" onclick="setMaxTrades(10)">10</button>
+          </div>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <div style="font-family:var(--mono);font-size:9px;color:#2d404f;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px">Sessions</div>
+          <div style="display:flex;gap:5px;flex-wrap:wrap">
+            <button class="sess-tog active" id="stg-Sydney" onclick="toggleSession(this,'Sydney')">Sydney</button>
+            <button class="sess-tog" id="stg-Tokyo" onclick="toggleSession(this,'Tokyo')">Tokyo</button>
+            <button class="sess-tog active" id="stg-London" onclick="toggleSession(this,'London')">London</button>
+            <button class="sess-tog active" id="stg-NewYork" onclick="toggleSession(this,'New York')">New York</button>
+          </div>
+        </div>
+
+        <div style="font-family:var(--mono);font-size:9px;background:#0d1219;border-radius:4px;padding:6px 8px;color:#2d404f;border:0.5px solid rgba(255,255,255,0.07)">
+          Risk per trade: <span style="color:var(--amber)" id="calcRisk">50.00</span> &nbsp;|&nbsp;
+          Est. lots: <span style="color:var(--green)" id="calcLots">0.37</span>
+        </div>
+      </div>
+    </div>
+
     <div class="sect">
       <div class="sect-label">Session Metrics</div>
       <div class="met-grid">
@@ -1160,9 +1389,151 @@ function demoSignals(){
   });
 }
 
-// Init
+// ══════════════════════════════════════════
+//  RISK CONFIG
+// ══════════════════════════════════════════
+let currentCfg = {};
+let maxTradesVal = 5;
+let activeSessions = ['London', 'New York'];
+
+function updCfg(){
+  const bal  = parseFloat(document.getElementById('sBalance').value);
+  const risk = parseFloat(document.getElementById('sRisk').value);
+  const dd   = parseFloat(document.getElementById('sDD').value);
+  const sl   = parseFloat(document.getElementById('sSL').value);
+  const rr   = parseFloat(document.getElementById('sRR').value);
+  const tp1  = parseFloat(document.getElementById('sTP1').value);
+  const tp2  = parseFloat(document.getElementById('sTP2').value);
+  const sc   = parseFloat(document.getElementById('sScore').value);
+  const sp   = parseFloat(document.getElementById('sSpread').value);
+
+  document.getElementById('vBalance').textContent = '$' + bal.toLocaleString();
+  document.getElementById('vRisk').textContent    = risk.toFixed(1) + '%';
+  document.getElementById('vDD').textContent      = dd.toFixed(1) + '%';
+  document.getElementById('vSL').textContent      = sl + ' pips';
+  document.getElementById('vRR').textContent      = '1 : ' + rr.toFixed(1);
+  document.getElementById('vTP1').textContent     = tp1.toFixed(1) + ' R';
+  document.getElementById('vTP2').textContent     = tp2.toFixed(1) + ' R';
+  document.getElementById('vScore').textContent   = sc + '%';
+  document.getElementById('vSpread').textContent  = sp.toFixed(1) + ' pips';
+
+  // Live lot size calc
+  const riskUSD = bal * risk / 100;
+  const pipVal  = 10; // approx for majors
+  const lots    = Math.max(0.01, Math.min((riskUSD / (sl * pipVal)).toFixed(2), 10));
+  document.getElementById('calcRisk').textContent = '$' + riskUSD.toFixed(2);
+  document.getElementById('calcLots').textContent = lots;
+
+  currentCfg = { account_balance:bal, risk_pct:risk, max_daily_dd:dd,
+    sl_pips:sl, min_rr:rr, tp1_r:tp1, tp2_r:tp2,
+    min_score:sc/100, max_spread_pips:sp,
+    max_open_trades:maxTradesVal, sessions:activeSessions };
+}
+
+function setMaxTrades(n){
+  maxTradesVal = n;
+  document.querySelectorAll('.trd-btn').forEach(b=>b.classList.remove('active'));
+  const el = document.getElementById('tb'+n);
+  if(el) el.classList.add('active');
+  updCfg();
+}
+
+function toggleSession(btn, name){
+  btn.classList.toggle('active');
+  if(btn.classList.contains('active')){
+    if(!activeSessions.includes(name)) activeSessions.push(name);
+  } else {
+    activeSessions = activeSessions.filter(s=>s!==name);
+  }
+  updCfg();
+}
+
+async function saveConfig(){
+  updCfg();
+  try{
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(currentCfg)
+    });
+    const d = await r.json();
+    if(Object.keys(d.errors||{}).length){
+      showToast('⚠ Some values invalid: ' + Object.keys(d.errors).join(', '),'tw');
+    } else {
+      showToast('✓ Risk config saved — affects next scan','tb');
+      addLog('Risk config saved: risk=' + currentCfg.risk_pct + '% sl=' + currentCfg.sl_pips + 'p rr=1:' + currentCfg.min_rr,'CFG','info');
+    }
+  } catch(e){
+    showToast('Config saved locally (backend offline)','tw');
+  }
+}
+
+async function resetConfig(){
+  try{
+    const r = await fetch('/api/config/reset', { method:'POST' });
+    const d = await r.json();
+    loadConfig(d.config);
+    showToast('✓ Config reset to defaults','tb');
+    addLog('Risk config reset to defaults','CFG','info');
+  } catch(e){
+    // reset locally
+    document.getElementById('sBalance').value=10000;
+    document.getElementById('sRisk').value=1.5;
+    document.getElementById('sDD').value=5;
+    document.getElementById('sSL').value=20;
+    document.getElementById('sRR').value=2.5;
+    document.getElementById('sTP1').value=1.5;
+    document.getElementById('sTP2').value=3;
+    document.getElementById('sScore').value=50;
+    document.getElementById('sSpread').value=2.5;
+    maxTradesVal=5; activeSessions=['London','New York'];
+    updCfg();
+    showToast('Config reset locally','tw');
+  }
+}
+
+function loadConfig(cfg){
+  if(!cfg) return;
+  const set = (id, val) => { const el=document.getElementById(id); if(el) el.value=val; };
+  set('sBalance', cfg.account_balance||10000);
+  set('sRisk',    cfg.risk_pct||1.5);
+  set('sDD',      cfg.max_daily_dd||5);
+  set('sSL',      cfg.sl_pips||20);
+  set('sRR',      cfg.min_rr||2.5);
+  set('sTP1',     cfg.tp1_r||1.5);
+  set('sTP2',     cfg.tp2_r||3);
+  set('sScore',   (cfg.min_score||0.5)*100);
+  set('sSpread',  cfg.max_spread_pips||2.5);
+  maxTradesVal = cfg.max_open_trades||5;
+  activeSessions = cfg.sessions||['London','New York'];
+  // Update trade buttons
+  [1,2,3,5,10].forEach(n=>{
+    const b=document.getElementById('tb'+n);
+    if(b) b.className='trd-btn'+(n===maxTradesVal?' active':'');
+  });
+  // Update session toggles
+  ['Sydney','Tokyo','London','New York'].forEach(s=>{
+    const id='stg-'+s.replace(' ','');
+    const b=document.getElementById(id);
+    if(b) b.className='sess-tog'+(activeSessions.includes(s)?' active':'');
+  });
+  updCfg();
+}
+
+async function fetchConfig(){
+  try{
+    const r=await fetch('/api/config',{signal:AbortSignal.timeout(5000)});
+    const d=await r.json();
+    loadConfig(d.config);
+  } catch(e){ updCfg(); } // use defaults
+}
+
+// ══════════════════════════════════════════
+//  Init
 (async function(){
   addLog('Server started — fetching live prices...','SYS','info');
+  // Load risk config from backend
+  await fetchConfig();
   // Fetch real prices first (works even on weekends)
   await refreshLivePrices();
   addLog('Live prices loaded from yfinance','SYS','info');
@@ -1190,6 +1561,22 @@ def open_browser():
     time.sleep(1.2)
     webbrowser.open("http://localhost:5000")
 
+
+def keep_alive():
+    """Ping self every 10 min to prevent Render free tier sleep."""
+    import urllib.request
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if not render_url:
+        return  # only runs on Render
+    time.sleep(60)  # wait for server to start
+    while True:
+        try:
+            urllib.request.urlopen(render_url + "/api/health", timeout=10)
+            log.info("Keep-alive ping sent")
+        except Exception:
+            pass
+        time.sleep(600)  # every 10 minutes
+
 if __name__ == "__main__":
     ms = market_status()
 
@@ -1211,4 +1598,13 @@ if __name__ == "__main__":
     t = threading.Thread(target=open_browser, daemon=True)
     t.start()
 
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    # Keep-alive for Render free tier
+    ka = threading.Thread(target=keep_alive, daemon=True)
+    ka.start()
+
+    port = int(os.environ.get("PORT", 5000))
+    is_local = port == 5000
+    if is_local:
+        t = threading.Thread(target=open_browser, daemon=True)
+        t.start()
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
