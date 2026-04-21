@@ -35,9 +35,9 @@ class Config:
     DASHBOARD_URL  = "http://localhost:5000"
     # DASHBOARD_URL = "https://your-app.onrender.com"
 
-    MT5_LOGIN      = 0
-    MT5_PASSWORD   = ""
-    MT5_SERVER     = "ICMarkets-Demo"
+    MT5_LOGIN      = 414087232
+    MT5_PASSWORD   = "!kwJmW9Ivm"
+    MT5_SERVER     = "GoatFunded-Server2"
     MT5_PATH       = r"C:\Program Files\MetaTrader 5\terminal64.exe"
     SYMBOL_SUFFIX  = ""       # some brokers add ".m" or "_raw"
 
