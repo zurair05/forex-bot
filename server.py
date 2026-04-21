@@ -56,6 +56,13 @@ BAR_TTL    = 300
 SIGNAL_TTL = 900
 PRICE_TTL  = 60
 
+# ── Trade lifecycle ───────────────────────────────────────────────────
+# Tracks active signals and whether TP/SL has been hit
+# { pair: { "status": "active"|"tp1_hit"|"tp2_hit"|"sl_hit",
+#           "entry", "sl", "tp1", "tp2", "direction", "hit_at", "hit_price" } }
+_trade_state: dict = {}
+_signal_history: list = []   # last 20 completed signals
+
 # ── Market hours ──────────────────────────────────────────────────────
 def market_status():
     now = datetime.now(timezone.utc)
@@ -266,16 +273,138 @@ def make_signal(pair, htf, mtf, ltf):
             "disc":mtf.get("disc",False),"prem":mtf.get("prem",False),
             "zones":zones,"ts":datetime.now(timezone.utc).isoformat()}
 
+def check_trade_outcomes(prices: dict):
+    """
+    For every active signal, check if current price has hit TP1, TP2 or SL.
+    If hit → mark as complete and clear from signal cache so a NEW signal
+    can be generated on the next scan.
+    """
+    global _trade_state, _signal_cache, _signal_history
+
+    for pair, state in list(_trade_state.items()):
+        if state.get("status") != "active":
+            continue
+
+        cur = prices.get(pair, {}).get("price", 0)
+        if cur == 0:
+            continue
+
+        direction = state["direction"]
+        entry     = state["entry"]
+        sl        = state["sl"]
+        tp1       = state["tp1"]
+        tp2       = state["tp2"]
+        outcome   = None
+        hit_price = cur
+
+        if direction == "BUY":
+            if cur <= sl:
+                outcome   = "sl_hit"
+                hit_price = sl
+            elif cur >= tp2:
+                outcome   = "tp2_hit"
+                hit_price = tp2
+            elif cur >= tp1 and state.get("status") == "active":
+                outcome   = "tp1_hit"
+                hit_price = tp1
+        else:  # SELL
+            if cur >= sl:
+                outcome   = "sl_hit"
+                hit_price = sl
+            elif cur <= tp2:
+                outcome   = "tp2_hit"
+                hit_price = tp2
+            elif cur <= tp1 and state.get("status") == "active":
+                outcome   = "tp1_hit"
+                hit_price = tp1
+
+        if outcome:
+            dp  = DIGITS.get(pair, 5)
+            p   = PIP.get(pair, 0.0001)
+            pnl_pips = (hit_price - entry) / p if direction == "BUY" else (entry - hit_price) / p
+            pnl_pips = round(pnl_pips, 1)
+
+            log.info(f"  {pair} {outcome.upper()}: entry={entry} hit={hit_price:.{dp}f} "
+                     f"pnl={pnl_pips:+.1f}pips")
+
+            # Record in history
+            completed = {**state,
+                "status":    outcome,
+                "hit_price": round(hit_price, dp),
+                "hit_at":    datetime.now(timezone.utc).isoformat(),
+                "pnl_pips":  pnl_pips,
+                "result":    "win" if "tp" in outcome else "loss"}
+            _signal_history.insert(0, completed)
+            _signal_history[:] = _signal_history[:20]   # keep last 20
+
+            # Update state — TP1 keeps signal alive (watching for TP2),
+            # TP2 and SL both clear the signal → new signal allowed
+            if outcome == "tp1_hit":
+                _trade_state[pair]["status"] = "tp1_hit"
+                # Move virtual SL to breakeven after TP1
+                _trade_state[pair]["sl"] = entry
+                log.info(f"  {pair}: TP1 hit — SL moved to breakeven, watching TP2")
+            else:
+                # Signal fully completed — remove from cache so next scan gives fresh signal
+                _trade_state.pop(pair, None)
+                _signal_cache.pop(pair, None)
+                log.info(f"  {pair}: Signal CLOSED ({outcome}) — ready for new signal")
+
+
+def activate_signal(sig: dict):
+    """Register a new signal as active in trade state tracker."""
+    global _trade_state
+    pair = sig["pair"]
+    if sig["direction"] == "WAIT":
+        return
+    # Only register if not already tracking this pair
+    if pair not in _trade_state or _trade_state[pair].get("status") not in ("active","tp1_hit"):
+        _trade_state[pair] = {
+            "pair":      pair,
+            "direction": sig["direction"],
+            "entry":     sig["entry"],
+            "sl":        sig["sl"],
+            "tp1":       sig["tp1"],
+            "tp2":       sig["tp2"],
+            "score_pct": sig["score_pct"],
+            "conf":      sig["conf"],
+            "status":    "active",
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+            "hit_price": None,
+            "hit_at":    None,
+        }
+        log.info(f"  {pair}: Signal ACTIVATED — watching SL={sig['sl']} TP1={sig['tp1']} TP2={sig['tp2']}")
+
+
 def run_scan(force=False):
-    global _signal_cache
+    global _signal_cache, _last_scan_ts
+    _last_scan_ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     ms=market_status(); prices=fetch_prices(); out=[]
+
+    # Step 1: Check if any active signals hit TP or SL
+    # If hit → clears cache so a fresh signal can be generated below
+    check_trade_outcomes(prices)
+
     for pair in PAIRS:
-        cur_price=prices.get(pair,{}).get("price",0)
-        # Use cache if price hasn't moved more than 0.03%
-        if not force and pair in _signal_cache:
-            cached=_signal_cache[pair]; lp=cached.get("entry",0)
-            if lp>0 and abs(cur_price-lp)/lp<0.0003:
-                cached["cached"]=True; out.append(cached); continue
+        cur_price = prices.get(pair, {}).get("price", 0)
+        state     = _trade_state.get(pair, {})
+
+        # Step 2: If signal is still active (between entry and TP2/SL), keep showing it
+        if state.get("status") in ("active", "tp1_hit") and not force:
+            if pair in _signal_cache:
+                sig = dict(_signal_cache[pair])
+                sig["cached"]        = True
+                sig["trade_status"]  = state["status"]
+                # Update live P&L pips
+                if cur_price and sig.get("entry"):
+                    p = PIP.get(pair, 0.0001)
+                    pnl = (cur_price - sig["entry"]) / p if sig["direction"] == "BUY"                           else (sig["entry"] - cur_price) / p
+                    sig["live_pnl_pips"] = round(pnl, 1)
+                out.append(sig)
+                log.info(f"  {pair}: IN TRADE ({state['status']}) — holding signal")
+                continue
+
+        # Step 3: Generate fresh signal (TP/SL hit OR first scan OR forced)
         try:
             if ms["is_open"]:
                 bh=fetch_bars(pair,"H4"); bm=fetch_bars(pair,"H1"); bl=fetch_bars(pair,"M15")
@@ -283,18 +412,33 @@ def run_scan(force=False):
             else:
                 bh=bm=bl=demo_bars(pair)
             htf=analyse(bh or bm,pair); mtf=analyse(bm,pair); ltf=analyse(bl or bm,pair)
-            sig=make_signal(pair,htf,mtf,ltf); sig["cached"]=False; sig["demo"]=not ms["is_open"]
-            _signal_cache[pair]=sig; out.append(sig)
-            log.info(f"  {pair}: {sig['direction']} {sig['score_pct']}%")
+            sig=make_signal(pair,htf,mtf,ltf)
+            sig["cached"]        = False
+            sig["demo"]          = not ms["is_open"]
+            sig["trade_status"]  = "new"
+            sig["live_pnl_pips"] = 0
+            _signal_cache[pair]  = sig
+
+            # Step 4: Register new valid signal in trade tracker
+            if sig["direction"] != "WAIT":
+                activate_signal(sig)
+
+            out.append(sig)
+            log.info(f"  {pair}: {sig['direction']} {sig['score_pct']}% [NEW]")
         except Exception as e:
             log.warning(f"  {pair}: {e}")
             if pair in _signal_cache: out.append(_signal_cache[pair])
     return out
 
 # ── API routes ────────────────────────────────────────────────────────
+_last_scan_ts: str = ""
+
 @app.route("/api/status")
 def api_status():
-    return jsonify(market_status())
+    ms = market_status()
+    ms["last_scan"] = _last_scan_ts
+    ms["auto_scan_interval"] = AUTO_SCAN_INTERVAL
+    return jsonify(ms)
 
 @app.route("/api/prices")
 def api_prices():
@@ -307,6 +451,16 @@ def api_scan():
     ms=market_status()
     return jsonify({"signals":sigs,"market":ms,"count":len(sigs),
                     "ts":datetime.now(timezone.utc).isoformat()})
+
+@app.route("/api/trade-state")
+def api_trade_state():
+    """Returns active trade states and signal history."""
+    return jsonify({
+        "active":  _trade_state,
+        "history": _signal_history,
+        "ts":      datetime.now(timezone.utc).isoformat()
+    })
+
 
 @app.route("/api/bars/<pair>")
 def api_bars(pair):
@@ -489,6 +643,12 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
 .sc-time{font-family:var(--mono);font-size:8px;color:var(--t2)}
 .sc-st{font-family:var(--mono);font-size:8px;margin-top:3px}
 .sc-open{color:var(--g)}.sc-cls{color:var(--t3)}
+.trade-status{font-family:var(--mono);font-size:9px;padding:2px 7px;border-radius:3px;margin-bottom:.5rem;display:inline-block}
+.ts-active{background:var(--ga);color:var(--g);border:1px solid rgba(0,255,179,.2)}
+.ts-tp1{background:var(--bla);color:var(--bl);border:1px solid rgba(61,159,255,.2)}
+.ts-sl{background:var(--ra);color:var(--r);border:1px solid rgba(255,61,90,.2)}
+.ts-tp2{background:var(--ga);color:var(--g);border:1px solid rgba(0,255,179,.3);font-weight:700}
+.hist-row{display:flex;align-items:center;gap:6px;padding:4px 7px;border-radius:3px;border:1px solid var(--b);background:var(--bg2);font-family:var(--mono);font-size:9px}
 .demo-btn{font-family:var(--mono);font-size:10px;padding:6px 14px;border-radius:3px;
           border:1px solid var(--b2);background:transparent;color:var(--t2);cursor:pointer;margin-top:.5rem}
 .demo-btn:hover{background:var(--bg2);color:var(--t)}
@@ -533,6 +693,11 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
   </div>
 </nav>
 
+<div style="display:flex;align-items:center;justify-content:space-between;padding:2px 1.25rem;background:var(--bg1);border-bottom:1px solid var(--b);font-family:var(--mono);font-size:9px;color:var(--t3)">
+  <span id="autoScanStatus">⟳ Auto-scan every 5 min</span>
+  <span id="countdownEl" style="color:var(--t2)">Next scan: —</span>
+  <span id="lastScanEl">Last scan: —</span>
+</div>
 <div class="ticker" id="tickerStrip">
   <span class="tick" id="tick_EURUSD" onclick="selPair(null,'EURUSD')"><span class="tsym">EUR/USD</span><span class="tpx">—</span></span>
   <span class="tick" id="tick_GBPUSD" onclick="selPair(null,'GBPUSD')"><span class="tsym">GBP/USD</span><span class="tpx">—</span></span>
@@ -577,6 +742,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
         <div class="lv"><div class="lvk">TP2 · 3.0R</div><div class="lvv lv-t" id="lvT2">—</div></div>
         <div class="lv"><div class="lvk">R:R</div><div class="lvv lv-rr" id="lvRR">—</div></div>
         <div class="lv"><div class="lvk">Trend</div><div class="lvv" id="lvTr" style="color:var(--t)">—</div></div>
+        <div class="lv" style="grid-column:span 2"><div class="lvk">Live P&amp;L</div><div class="lvv" id="lvPnl" style="color:var(--t2)">— pips</div></div>
       </div>
       <div class="ctags" id="ctags"><span class="ctag neutral">Run scan first</span></div>
     </div>
@@ -584,6 +750,21 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
     <div class="sect">
       <div class="slbl">SMC Zones</div>
       <div class="zlist" id="zlist"><div class="zrow"><span class="zname" style="color:var(--t3)">Scan to detect</span></div></div>
+    </div>
+
+    <div class="sect" id="histSect">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.55rem">
+        <div class="slbl" style="margin:0">P&amp;L History</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--t3)" id="histStats">—</div>
+      </div>
+      <div id="histList" style="display:flex;flex-direction:column;gap:3px;max-height:160px;overflow-y:auto">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--t3);padding:4px 0">No completed signals yet</div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-top:.5rem">
+        <div class="mc"><div class="mck">Total</div><div class="mcv" id="hTotal">0</div></div>
+        <div class="mc"><div class="mck">Win Rate</div><div class="mcv mcg" id="hWR">—</div></div>
+        <div class="mc"><div class="mck">Net Pips</div><div class="mcv" id="hNet">0</div></div>
+      </div>
     </div>
 
     <div class="sect">
@@ -908,23 +1089,188 @@ function showToast(msg,cls){
   setTimeout(()=>t.classList.remove('show'),4000);
 }
 
+// ── Trade state polling ──────────────────────────────────────
+async function pollTradeState(){
+  try{
+    const d=await(await fetch('/api/trade-state',{signal:AbortSignal.timeout(5000)})).json();
+    buildHistory(d.history||[]);
+    // Update live pnl for active pair
+    const st=d.active[pair];
+    if(st){
+      const sig=allSigs.find(s=>s.pair===pair);
+      if(sig && sig.live_pnl_pips!==undefined){
+        const pnl=sig.live_pnl_pips;
+        const el=document.getElementById('lvPnl');
+        if(el){
+          el.textContent=(pnl>=0?'+':'')+pnl.toFixed(1)+' pips';
+          el.style.color=pnl>0?'var(--g)':pnl<0?'var(--r)':'var(--t2)';
+        }
+      }
+    }
+  }catch(e){}
+}
+
+function buildHistory(history){
+  const hl=document.getElementById('histList');
+  if(!history.length){
+    hl.innerHTML='<div style="font-family:var(--mono);font-size:9px;color:var(--t3)">No completed signals yet</div>';
+    return;
+  }
+  hl.innerHTML=history.map(h=>{
+    const dp=DIGITS[h.pair]||5;
+    const isWin=h.result==='win';
+    const outcomeLabel=h.status==='tp2_hit'?'TP2 ✓':h.status==='tp1_hit'?'TP1 ✓':'SL ✗';
+    const outcomeColor=h.status==='sl_hit'?'var(--r)':'var(--g)';
+    const pnl=h.pnl_pips||0;
+    return `<div class="hist-row">
+      <span style="color:${h.direction==='BUY'?'var(--g)':'var(--r)'};font-weight:700;min-width:28px">${h.direction==='BUY'?'B':'S'}</span>
+      <span style="color:var(--t);min-width:50px">${h.pair.slice(0,3)+'/'+h.pair.slice(3)}</span>
+      <span style="color:${outcomeColor};min-width:38px">${outcomeLabel}</span>
+      <span style="color:${pnl>=0?'var(--g)':'var(--r)'};flex:1;text-align:right">${pnl>=0?'+':''}${pnl.toFixed(1)}p</span>
+    </div>`;
+  }).join('');
+}
+
+// Also update updateSignal to show trade status badge
+const _origUpdateSignal = updateSignal;
+function updateSignalWithState(sig){
+  updateSignal_base(sig);
+  // Show trade status
+  const ts=sig.trade_status;
+  const container=document.getElementById('ctags').parentElement;
+  let badge=document.getElementById('tradeStatusBadge');
+  if(!badge){badge=document.createElement('div');badge.id='tradeStatusBadge';container.insertBefore(badge,document.getElementById('ctags'));}
+  if(ts==='active')  badge.innerHTML='<span class="trade-status ts-active">● SIGNAL ACTIVE — watching TP/SL</span>';
+  else if(ts==='tp1_hit') badge.innerHTML='<span class="trade-status ts-tp1">▲ TP1 HIT — SL at breakeven, watching TP2</span>';
+  else if(ts==='new') badge.innerHTML='<span class="trade-status ts-active">★ NEW SIGNAL</span>';
+  else badge.innerHTML='';
+  // Live pnl
+  const pnl=sig.live_pnl_pips||0;
+  const el=document.getElementById('lvPnl');
+  if(el){el.textContent=(pnl>=0?'+':'')+pnl.toFixed(1)+' pips';el.style.color=pnl>0?'var(--g)':pnl<0?'var(--r)':'var(--t2)';}
+}
+
+// Rename original and wrap
+const updateSignal_base = updateSignal;
+updateSignal = updateSignalWithState;
+
+setInterval(pollTradeState, 15000);
+
+// ── Auto-scan countdown & frontend polling ─────────────────────
+const AUTO_INTERVAL = 300; // must match server AUTO_SCAN_INTERVAL
+let nextScanIn = AUTO_INTERVAL;
+let lastScanTime = null;
+
+function updateCountdown(){
+  nextScanIn = Math.max(0, nextScanIn - 1);
+  const m = Math.floor(nextScanIn/60);
+  const s = String(nextScanIn%60).padStart(2,'0');
+  const el = document.getElementById('countdownEl');
+  if(el) el.textContent = `Next scan: ${m}:${s}`;
+  if(nextScanIn === 0){
+    nextScanIn = AUTO_INTERVAL;
+    // Fetch fresh signals from server (server already ran the scan)
+    fetchLatestSignals();
+  }
+}
+setInterval(updateCountdown, 1000);
+
+async function fetchLatestSignals(){
+  // Just fetch what the server already scanned — no force
+  try{
+    addLog('Auto-fetching latest signals...','SYS','info');
+    const d = await(await fetch('/api/scan',{signal:AbortSignal.timeout(30000)})).json();
+    allSigs = d.signals||[];
+    buildTable(allSigs);
+    const active = allSigs.find(s=>s.pair===pair);
+    if(active){ updateSignalWithState(active); loadChart(pair); }
+    allSigs.forEach(s=>{
+      if(s.direction!=='WAIT'&&!s.cached){
+        const t=s.direction==='BUY'?'buy':'sell';
+        addLog(`AUTO: ${s.direction} ${s.score_pct}% | ${(s.conf||[]).join(', ')}`,s.pair,t);
+        if(s.trade_status==='new')
+          showToast(`${s.direction==='BUY'?'📈':'📉'} NEW: ${s.pair} ${s.direction} — ${s.score_pct}%`,
+                    s.direction==='BUY'?'tb':'ts');
+      }
+    });
+    // Update stats
+    document.getElementById('mSig').textContent = allSigs.length;
+    document.getElementById('mBuy').textContent = allSigs.filter(s=>s.direction==='BUY').length;
+    document.getElementById('mSell').textContent = allSigs.filter(s=>s.direction==='SELL').length;
+    const now = new Date();
+    const ts = String(now.getUTCHours()).padStart(2,'0')+':'+String(now.getUTCMinutes()).padStart(2,'0')+' UTC';
+    document.getElementById('mLast').textContent = ts;
+    const lsEl = document.getElementById('lastScanEl');
+    if(lsEl) lsEl.textContent = 'Last scan: '+ts;
+    lastScanTime = now;
+    addLog(`Auto-scan complete — ${allSigs.filter(s=>s.direction!=='WAIT').length} signals`,
+           'SYS','info');
+  } catch(e){
+    addLog('Auto-fetch error: '+e.message,'SYS','warn');
+  }
+}
+
+// ── P&L History builder ────────────────────────────────────────
+function buildHistory(history){
+  const hl = document.getElementById('histList');
+  if(!history||!history.length){
+    hl.innerHTML='<div style="font-family:var(--mono);font-size:9px;color:var(--t3);padding:4px 0">No completed signals yet</div>';
+    document.getElementById('hTotal').textContent='0';
+    document.getElementById('hWR').textContent='—';
+    document.getElementById('hNet').textContent='0';
+    return;
+  }
+  // Stats
+  const wins    = history.filter(h=>h.result==='win').length;
+  const losses  = history.filter(h=>h.result==='loss').length;
+  const total   = wins+losses;
+  const netPips = history.reduce((a,h)=>a+(h.pnl_pips||0),0);
+  const wr      = total>0?Math.round(wins/total*100):0;
+  document.getElementById('hTotal').textContent = total;
+  document.getElementById('hWR').textContent    = wr+'%';
+  document.getElementById('hWR').style.color    = wr>=50?'var(--g)':'var(--r)';
+  const netEl = document.getElementById('hNet');
+  netEl.textContent  = (netPips>=0?'+':'')+netPips.toFixed(1)+'p';
+  netEl.style.color  = netPips>=0?'var(--g)':'var(--r)';
+
+  // Rows
+  hl.innerHTML = history.map(h=>{
+    const dp    = DIGITS[h.pair]||5;
+    const isWin = h.result==='win';
+    const icons = {tp2_hit:'✓✓',tp1_hit:'✓ ',sl_hit:'✗ '};
+    const icon  = icons[h.status]||'?';
+    const pnl   = h.pnl_pips||0;
+    const col   = h.status==='sl_hit'?'var(--r)':pnl>0?'var(--g)':'var(--t2)';
+    const time  = h.hit_at ? new Date(h.hit_at).toLocaleTimeString('en',{hour:'2-digit',minute:'2-digit',hour12:false}) : '—';
+    return `<div style="display:flex;align-items:center;gap:5px;padding:4px 7px;border-radius:3px;border:1px solid var(--b);background:var(--bg2);font-family:var(--mono);font-size:9px">
+      <span style="color:${h.direction==='BUY'?'var(--g)':'var(--r)'};font-weight:700;min-width:10px">${h.direction==='BUY'?'B':'S'}</span>
+      <span style="color:var(--t);min-width:50px">${h.pair.slice(0,3)+'/'+h.pair.slice(3)}</span>
+      <span style="color:${col};min-width:22px">${icon}</span>
+      <span style="color:${col};flex:1;font-weight:500">${pnl>=0?'+':''}${pnl.toFixed(1)}p</span>
+      <span style="color:var(--t3)">${time}</span>
+    </div>`;
+  }).join('');
+}
+
 // ── Init ──────────────────────────────────────────────────────
 (async function(){
-  addLog('Dashboard ready','SYS','info');
-  // Load prices silently in background
+  addLog('Dashboard ready — auto-scan every 5 min','SYS','info');
   loadPrices();
-  // Check market status
-  const st=await checkStatus();
+  const st = await checkStatus();
   if(st&&st.is_open){
-    addLog('Market OPEN — click SCAN ALL for live signals','SYS','info');
-    // Load chart immediately
+    addLog('Market OPEN — running initial scan...','SYS','info');
     loadChart('EURUSD');
+    // Run first scan automatically on page load
+    await doScan(false);
   } else if(st&&st.is_closed){
     addLog('Market closed: '+st.reason,'SYS','warn');
+    loadChart('EURUSD');
   }
+  // Start fetching trade history
+  pollTradeState();
 })();
-setInterval(checkStatus,60000);
-setInterval(loadPrices,60000);
+setInterval(checkStatus, 60000);
+setInterval(loadPrices, 60000);
 </script>
 </body>
 </html>
@@ -933,9 +1279,27 @@ setInterval(loadPrices,60000);
 def open_browser():
     """Only opens browser when running locally, not on Render."""
     if os.environ.get("RENDER"):
-        return  # skip on Render server
+        return
     time.sleep(1.2)
     webbrowser.open("http://localhost:5000")
+
+
+AUTO_SCAN_INTERVAL = 300   # seconds — auto scan every 5 minutes
+
+def auto_scan_loop():
+    """Background thread: runs a scan every AUTO_SCAN_INTERVAL seconds."""
+    log.info(f"Auto-scan started — every {AUTO_SCAN_INTERVAL}s")
+    time.sleep(15)   # wait for server to fully start first
+    while True:
+        try:
+            ms = market_status()
+            log.info(f"[AUTO-SCAN] Running... market={'OPEN' if ms['is_open'] else 'CLOSED'}")
+            run_scan(force=False)
+            log.info(f"[AUTO-SCAN] Done. Next in {AUTO_SCAN_INTERVAL}s")
+        except Exception as e:
+            log.error(f"[AUTO-SCAN] Error: {e}")
+        time.sleep(AUTO_SCAN_INTERVAL)
+
 
 if __name__ == "__main__":
     ms = market_status()
@@ -950,4 +1314,9 @@ if __name__ == "__main__":
     print(f"\n  Opening  : http://localhost:5000\n")
     t = threading.Thread(target=open_browser, daemon=True)
     t.start()
+
+    # Start auto-scan background thread
+    scanner = threading.Thread(target=auto_scan_loop, daemon=True)
+    scanner.start()
+
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
