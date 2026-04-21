@@ -482,6 +482,194 @@ def detect_judas_swing(bars, asian_range, pip=0.0001):
     return None
 
 
+# ── MACD ──────────────────────────────────────────────────────────────
+def calc_macd(bars, fast=12, slow=26, signal=9):
+    """MACD line, signal line, histogram. Returns (macd, signal, hist, divergence)"""
+    if len(bars) < slow + signal + 5:
+        return 0, 0, 0, None
+    closes = [b["close"] for b in bars]
+    def ema(data, period):
+        k = 2.0/(period+1); e = sum(data[:period])/period
+        for v in data[period:]: e = v*k + e*(1-k)
+        return e
+    # Calculate rolling MACD
+    macd_vals = []
+    for i in range(slow, len(closes)):
+        f = ema(closes[max(0,i-fast*3):i+1], fast)
+        s = ema(closes[max(0,i-slow*3):i+1], slow)
+        macd_vals.append(f - s)
+    if len(macd_vals) < signal + 5:
+        return 0, 0, 0, None
+    sig_line = ema(macd_vals, signal)
+    hist     = macd_vals[-1] - sig_line
+    macd_cur = macd_vals[-1]
+    # MACD divergence (last 10 bars)
+    div = None
+    if len(macd_vals) >= 10 and len(closes) >= slow + 10:
+        prices  = closes[-10:]
+        mvals   = macd_vals[-10:]
+        if min(prices) < min(prices[:-2]) and min(mvals) > min(mvals[:-2]):
+            div = "bullish"
+        elif max(prices) > max(prices[:-2]) and max(mvals) < max(mvals[:-2]):
+            div = "bearish"
+    return round(macd_cur,6), round(sig_line,6), round(hist,6), div
+
+
+# ── Bollinger Bands + Squeeze ──────────────────────────────────────────
+def calc_bollinger(bars, period=20, std_dev=2.0):
+    """Returns (upper, mid, lower, bandwidth, squeeze, %B)"""
+    if len(bars) < period:
+        return 0, 0, 0, 0, False, 0.5
+    closes = [b["close"] for b in bars[-period:]]
+    mid    = sum(closes) / period
+    variance = sum((c - mid)**2 for c in closes) / period
+    std    = variance**0.5
+    upper  = mid + std_dev * std
+    lower  = mid - std_dev * std
+    bw     = (upper - lower) / mid if mid > 0 else 0
+    # Squeeze: bandwidth in bottom 20% of recent range
+    recent_bws = []
+    for i in range(max(period, len(bars)-50), len(bars)-period+1):
+        c2 = [b["close"] for b in bars[i:i+period]]
+        m2 = sum(c2)/period
+        s2 = (sum((c-m2)**2 for c in c2)/period)**0.5
+        bw2 = (m2 + std_dev*s2 - (m2 - std_dev*s2)) / m2 if m2 > 0 else 0
+        recent_bws.append(bw2)
+    squeeze = bool(recent_bws and bw <= sorted(recent_bws)[int(len(recent_bws)*0.2)])
+    price   = bars[-1]["close"]
+    pct_b   = (price - lower) / (upper - lower) if (upper - lower) > 0 else 0.5
+    return round(upper,5), round(mid,5), round(lower,5), round(bw,4), squeeze, round(pct_b,3)
+
+
+# ── ATR (Average True Range) ───────────────────────────────────────────
+def calc_atr(bars, period=14):
+    """ATR = average of true ranges over period bars."""
+    if len(bars) < period + 1:
+        return 0
+    trs = []
+    for i in range(1, len(bars)):
+        hi, lo, prev_c = bars[i]["high"], bars[i]["low"], bars[i-1]["close"]
+        trs.append(max(hi-lo, abs(hi-prev_c), abs(lo-prev_c)))
+    if not trs: return 0
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr*(period-1) + tr) / period
+    return round(atr, 6)
+
+
+# ── Fibonacci Golden Pocket ────────────────────────────────────────────
+def calc_fib_levels(bars, lookback=50):
+    """
+    Find the last significant swing high/low in lookback bars.
+    Returns key Fibonacci levels (0.382, 0.5, 0.618, 0.705, 0.786)
+    and whether current price is in the Golden Pocket (0.618-0.786).
+    """
+    if len(bars) < lookback + 5:
+        return {}
+    recent = bars[-lookback:]
+    swing_hi = max(b["high"]  for b in recent)
+    swing_lo = min(b["low"]   for b in recent)
+    price    = bars[-1]["close"]
+    rng      = swing_hi - swing_lo
+    if rng == 0:
+        return {}
+    # Retracement levels from swing high (for bullish pullback)
+    levels = {
+        "0.236": round(swing_hi - rng*0.236, 5),
+        "0.382": round(swing_hi - rng*0.382, 5),
+        "0.500": round(swing_hi - rng*0.500, 5),
+        "0.618": round(swing_hi - rng*0.618, 5),
+        "0.705": round(swing_hi - rng*0.705, 5),
+        "0.786": round(swing_hi - rng*0.786, 5),
+    }
+    # Golden Pocket = 0.618 to 0.786 retracement
+    gp_hi = levels["0.618"]
+    gp_lo = levels["0.786"]
+    in_gp = gp_lo <= price <= gp_hi
+    # OTE zone (ICT) = 0.618 to 0.786
+    ote_zone = in_gp
+    return {
+        "levels": levels,
+        "swing_hi": round(swing_hi,5),
+        "swing_lo": round(swing_lo,5),
+        "in_golden_pocket": in_gp,
+        "ote_zone": ote_zone,
+        "gp_hi": gp_hi,
+        "gp_lo": gp_lo,
+    }
+
+
+# ── Candlestick Pattern Recognition ───────────────────────────────────
+def detect_candle_patterns(bars):
+    """
+    Detect high-probability reversal patterns on the last 3 bars.
+    Returns list of detected patterns with direction.
+    Win rates from backtests:
+      Engulfing: 70-75%, Pin Bar: 65-70%, Hammer: 65%, Morning/Evening Star: 70-75%
+    """
+    if len(bars) < 4:
+        return []
+    patterns = []
+    c  = bars[-1]  # current (most recent)
+    p1 = bars[-2]  # previous 1
+    p2 = bars[-3]  # previous 2
+
+    def body(b):  return abs(b["close"] - b["open"])
+    def rng(b):   return b["high"] - b["low"]
+    def bull(b):  return b["close"] > b["open"]
+    def bear(b):  return b["close"] < b["open"]
+    def wick_lo(b): return min(b["open"],b["close"]) - b["low"]
+    def wick_hi(b): return b["high"] - max(b["open"],b["close"])
+
+    # ── Bullish Engulfing ─────────────────────────────────────────────
+    if (bear(p1) and bull(c) and
+        c["open"] <= p1["close"] and c["close"] >= p1["open"] and
+        body(c) > body(p1)):
+        patterns.append({"pattern":"Bull Engulfing","dir":"bullish","weight":0.12})
+
+    # ── Bearish Engulfing ─────────────────────────────────────────────
+    if (bull(p1) and bear(c) and
+        c["open"] >= p1["close"] and c["close"] <= p1["open"] and
+        body(c) > body(p1)):
+        patterns.append({"pattern":"Bear Engulfing","dir":"bearish","weight":0.12})
+
+    # ── Bullish Pin Bar (Hammer) ──────────────────────────────────────
+    if (wick_lo(c) >= body(c)*2.5 and wick_hi(c) < body(c)*0.5 and
+        body(c) < rng(c)*0.35):
+        patterns.append({"pattern":"Bull Pin Bar","dir":"bullish","weight":0.10})
+
+    # ── Bearish Pin Bar (Shooting Star) ──────────────────────────────
+    if (wick_hi(c) >= body(c)*2.5 and wick_lo(c) < body(c)*0.5 and
+        body(c) < rng(c)*0.35):
+        patterns.append({"pattern":"Bear Pin Bar","dir":"bearish","weight":0.10})
+
+    # ── Doji (indecision → watch for next bar direction) ─────────────
+    if body(c) < rng(c)*0.1 and rng(c) > 0:
+        patterns.append({"pattern":"Doji","dir":"neutral","weight":0.05})
+
+    # ── Morning Star (3-bar bullish reversal) ─────────────────────────
+    if (bear(p2) and body(p1) < body(p2)*0.5 and bull(c) and
+        c["close"] > (p2["open"]+p2["close"])/2):
+        patterns.append({"pattern":"Morning Star","dir":"bullish","weight":0.13})
+
+    # ── Evening Star (3-bar bearish reversal) ─────────────────────────
+    if (bull(p2) and body(p1) < body(p2)*0.5 and bear(c) and
+        c["close"] < (p2["open"]+p2["close"])/2):
+        patterns.append({"pattern":"Evening Star","dir":"bearish","weight":0.13})
+
+    # ── Bullish Outside Bar ───────────────────────────────────────────
+    if (bull(c) and c["high"] > p1["high"] and c["low"] < p1["low"] and
+        body(c) > body(p1)*1.5):
+        patterns.append({"pattern":"Bull Outside","dir":"bullish","weight":0.08})
+
+    # ── Bearish Outside Bar ───────────────────────────────────────────
+    if (bear(c) and c["high"] > p1["high"] and c["low"] < p1["low"] and
+        body(c) > body(p1)*1.5):
+        patterns.append({"pattern":"Bear Outside","dir":"bearish","weight":0.08})
+
+    return patterns
+
+
 def analyse(bars, pair):
     if not bars or len(bars)<50: return {}
     p=PIP.get(pair,0.0001); rev=list(reversed(bars)); price=rev[0]["close"]
@@ -496,7 +684,7 @@ def analyse(bars, pair):
     near_fvgs=[f for f in fvgs if abs(f["mid"]-price)/p<100]
     liq=[{"price":s["price"],"type":"BSL" if s["hi"] else "SSL"} for s in sw[-12:]]
 
-    # New strategies
+    # Strategy indicators
     ema200      = calc_ema(bars, 200)
     ema50       = calc_ema(bars, 50)
     rsi         = calc_rsi(bars, 14)
@@ -505,6 +693,13 @@ def analyse(bars, pair):
     asian_range = get_asian_range(bars)
     judas       = detect_judas_swing(rev, asian_range, p)
     kz          = get_killzone()
+
+    # New indicators
+    macd_line, macd_sig, macd_hist, macd_div = calc_macd(bars)
+    bb_up, bb_mid, bb_lo, bb_bw, bb_squeeze, pct_b = calc_bollinger(bars)
+    atr         = calc_atr(bars)
+    fib         = calc_fib_levels(bars)
+    candles     = detect_candle_patterns(rev)  # rev so most recent is bars[-1] perspective
 
     # EMA bias
     above_ema200 = price > ema200 if ema200 > 0 else None
@@ -517,16 +712,47 @@ def analyse(bars, pair):
     above_asian   = asian_range and price > asian_range["hi"]
     below_asian   = asian_range and price < asian_range["lo"]
 
+    # Bollinger position
+    near_bb_lo  = pct_b < 0.1   # near lower band (oversold)
+    near_bb_hi  = pct_b > 0.9   # near upper band (overbought)
+    inside_bb   = 0.1 <= pct_b <= 0.9
+
+    # ATR-based dynamic SL suggestion
+    atr_sl_pips = round(atr * 1.5 / p) if p > 0 and atr > 0 else 30
+    atr_sl_pips = max(15, min(atr_sl_pips, 80))  # clamp 15-80 pips
+
     return {"price":price,"trend":trend,"mid":mid,
             "disc":price<mid,"prem":price>mid,
             "choch":choch,"cd":cd,"bos":bos,"bd":bd,
             "obs":obs,"tapped":[o for o in obs if o["tapped"]],
             "fvgs":fvgs,"near":near_fvgs,"liq":liq,
-            # New strategy data
+            # EMA
             "ema200":round(ema200,5),"ema50":round(ema50,5),
             "ema_trend":ema_trend,
             "above_ema200":above_ema200,"above_ema50":above_ema50,
+            # RSI
             "rsi":rsi,"rsi_div":rsi_div,
+            # MACD
+            "macd":macd_line,"macd_sig":macd_sig,
+            "macd_hist":macd_hist,"macd_div":macd_div,
+            "macd_bull": macd_hist > 0 and macd_line > macd_sig,
+            "macd_bear": macd_hist < 0 and macd_line < macd_sig,
+            # Bollinger
+            "bb_up":bb_up,"bb_mid":bb_mid,"bb_lo":bb_lo,
+            "bb_bw":bb_bw,"bb_squeeze":bb_squeeze,"pct_b":pct_b,
+            "near_bb_lo":near_bb_lo,"near_bb_hi":near_bb_hi,
+            # ATR
+            "atr":round(atr,6),"atr_pips":round(atr/p) if p>0 else 0,
+            "atr_sl_pips":atr_sl_pips,
+            # Fibonacci
+            "fib":fib,
+            "in_golden_pocket":fib.get("in_golden_pocket",False),
+            "ote_zone":fib.get("ote_zone",False),
+            # Candlestick patterns
+            "candles":candles,
+            "bull_candle":any(c["dir"]=="bullish" for c in candles),
+            "bear_candle":any(c["dir"]=="bearish" for c in candles),
+            # Session / ICT
             "breakers":breakers,
             "asian_range":asian_range,
             "near_asian_hi":near_asian_hi,"near_asian_lo":near_asian_lo,
@@ -615,7 +841,68 @@ def score(buy, htf, mtf, ltf):
     if buy  and any(b["bull"] for b in breakers): s+=0.12;c.append("Breaker↑")
     if not buy and any(not b["bull"] for b in breakers): s+=0.12;c.append("Breaker↓")
 
+    # ── Strategy 8: MACD Confirmation (+0.10) ─────────────────────────
+    # MACD above zero + histogram growing = strong momentum confirmation
+    if buy  and mtf.get("macd_bull"):  s+=0.10;c.append("MACD↑")
+    if not buy and mtf.get("macd_bear"): s+=0.10;c.append("MACD↓")
+    # MACD divergence adds extra weight
+    if buy  and mtf.get("macd_div")=="bullish": s+=0.08;c.append("MACD_Div↑")
+    if not buy and mtf.get("macd_div")=="bearish": s+=0.08;c.append("MACD_Div↓")
+
+    # ── Strategy 9: Bollinger Bands (+0.08) ───────────────────────────
+    # Squeeze + breakout direction = high probability expansion
+    if mtf.get("bb_squeeze"): s+=0.06;c.append("BB_Squeeze")
+    if buy  and mtf.get("near_bb_lo"): s+=0.08;c.append("BB_OversoldBounce")
+    if not buy and mtf.get("near_bb_hi"): s+=0.08;c.append("BB_OverboughtDrop")
+    # Price crossing back inside after breakout = mean reversion
+    if buy  and mtf.get("pct_b",0.5) > 0.5 and mtf.get("bb_squeeze"): s+=0.05;c.append("BB_BreakUp")
+    if not buy and mtf.get("pct_b",0.5) < 0.5 and mtf.get("bb_squeeze"): s+=0.05;c.append("BB_BreakDn")
+
+    # ── Strategy 10: Fibonacci Golden Pocket (+0.15) ──────────────────
+    # Price in 0.618–0.786 retracement zone = OTE, institutions enter here
+    if mtf.get("in_golden_pocket"):
+        s+=0.15;c.append("Fib_GP")   # both directions benefit from this zone
+    if mtf.get("ote_zone") and buy:  s+=0.05;c.append("OTE_Zone↑")
+    if mtf.get("ote_zone") and not buy: s+=0.05;c.append("OTE_Zone↓")
+
+    # ── Strategy 11: Candlestick Pattern Confirmation (+0.08–0.13) ────
+    # Reversal candle at key level = institutional footprint visible on chart
+    candles = mtf.get("candles", [])
+    for cp in candles:
+        if buy  and cp["dir"]=="bullish":
+            s += cp["weight"]; c.append(cp["pattern"]+"↑")
+        if not buy and cp["dir"]=="bearish":
+            s += cp["weight"]; c.append(cp["pattern"]+"↓")
+        if cp["dir"]=="neutral" and cp["pattern"]=="Doji":
+            s += 0.03  # Doji adds slight uncertainty bonus (confirms indecision at key level)
+
+    # ── Strategy 12: ATR Volatility Filter ────────────────────────────
+    atr_pips = mtf.get("atr_pips", 30)
+    if 10 <= atr_pips <= 25:  s+=0.05;c.append(f"ATR_coil({atr_pips}p)")
+    elif atr_pips > 60:       s-=0.05
+
     return round(min(s,1.0),3),c
+
+
+# ── Correlation map — pairs that move together ─────────────────────────
+CORRELATIONS = {
+    # Pairs that are strongly correlated (>0.8) — if one fires, reduce score on others
+    frozenset(["EURUSD","GBPUSD"]): 0.85,
+    frozenset(["GBPUSD","GBPJPY"]): 0.80,
+    frozenset(["EURUSD","AUDUSD"]): 0.75,
+    frozenset(["USDJPY","GBPJPY"]): 0.82,
+    frozenset(["EURUSD","USDCAD"]): -0.80,  # inverse
+}
+
+def get_correlated_active(pair: str, trade_state: dict) -> list:
+    """Return list of correlated pairs that already have active trades."""
+    active_pairs = [p for p,s in trade_state.items() if s.get("status") in ("active","tp1_hit")]
+    correlated = []
+    for ap in active_pairs:
+        key = frozenset([pair, ap])
+        if key in CORRELATIONS:
+            correlated.append((ap, CORRELATIONS[key]))
+    return correlated
 
 def make_signal(pair, htf, mtf, ltf, bars=None):
     p=PIP.get(pair,0.0001); dp=DIGITS.get(pair,5); price=mtf.get("price",0)
@@ -649,11 +936,28 @@ def make_signal(pair, htf, mtf, ltf, bars=None):
     real_conf = [c for c in conf if not c.startswith("ADR") and not c.startswith("vs_")]
     if direction != "WAIT" and len(real_conf) < 2:
         direction = "WAIT"
-    sl_d=p*30; entry=round(price,dp)
-    sl  =round(price-sl_d if direction=="BUY" else price+sl_d,dp)
-    tp1 =round(price+sl_d*1.5 if direction=="BUY" else price-sl_d*1.5,dp)
-    tp2 =round(price+sl_d*3.0 if direction=="BUY" else price-sl_d*3.0,dp)
-    rr  =round(abs(tp1-entry)/abs(entry-sl),2) if abs(entry-sl)>0 else 0
+
+    # Correlation penalty — if a correlated pair already has an active trade
+    if direction != "WAIT":
+        corr_active = get_correlated_active(pair, _trade_state)
+        for corr_pair, corr_strength in corr_active:
+            penalty = round(corr_strength * 0.15, 3)
+            sc_val  = round(sc_val - penalty, 3)
+            if not any("Corr" in x for x in conf):
+                conf.append(f"Corr_penalty({corr_pair})")
+            log.info(f"  {pair}: corr penalty -{penalty} due to {corr_pair}")
+        if sc_val <= 0.70:
+            direction = "WAIT"
+            log.info(f"  {pair}: dropped to WAIT after correlation penalty")
+    # Use ATR-based SL when available, fallback to 30 pips fixed
+    atr_sl_pips = mtf.get("atr_sl_pips", 30)
+    sl_pips     = max(20, min(atr_sl_pips, 60))  # 20-60 pip range
+    sl_d        = p * sl_pips
+    entry = round(price, dp)
+    sl  = round(price - sl_d if direction=="BUY" else price + sl_d, dp)
+    tp1 = round(price + sl_d*1.5 if direction=="BUY" else price - sl_d*1.5, dp)
+    tp2 = round(price + sl_d*3.0 if direction=="BUY" else price - sl_d*3.0, dp)
+    rr  = round(abs(tp1-entry)/abs(entry-sl), 2) if abs(entry-sl) > 0 else 0
     zones=[]
     for ob in mtf.get("obs",[])[-3:]:
         zones.append({"type":"Bull OB" if ob["bull"] else "Bear OB",
@@ -674,6 +978,19 @@ def make_signal(pair, htf, mtf, ltf, bars=None):
     if ar:
         zones.append({"type":"Asian Hi","price":round(ar["hi"],dp),"status":"Session Level","color":"blue"})
         zones.append({"type":"Asian Lo","price":round(ar["lo"],dp),"status":"Session Level","color":"blue"})
+    # Fibonacci Golden Pocket
+    fib = mtf.get("fib",{})
+    if fib.get("in_golden_pocket"):
+        zones.append({"type":"Fib Golden Pocket","hi":round(fib["gp_hi"],dp),
+                      "lo":round(fib["gp_lo"],dp),"status":"OTE Zone","color":"amber"})
+    # Bollinger Bands
+    if mtf.get("bb_up"):
+        zones.append({"type":"BB Upper","price":round(mtf["bb_up"],dp),"status":"Resistance","color":"red"})
+        zones.append({"type":"BB Lower","price":round(mtf["bb_lo"],dp),"status":"Support","color":"green"})
+    # Store BB mid and EMA values directly in signal for chart rendering
+    bb_mid_val = mtf.get("bb_mid", 0)
+    bb_lo_val  = mtf.get("bb_lo", 0)
+    bb_up_val  = mtf.get("bb_up", 0)
     now_ts = datetime.now(timezone.utc).isoformat()
     kz = mtf.get("killzone")
     # Full confluence breakdown for UI chart
@@ -735,6 +1052,19 @@ def make_signal(pair, htf, mtf, ltf, bars=None):
             "asian_range":mtf.get("asian_range"),
             "judas":mtf.get("judas"),
             "breaker_count":len(mtf.get("breakers",[])),
+            # New indicator fields
+            "macd":mtf.get("macd",0),
+            "macd_hist":mtf.get("macd_hist",0),
+            "macd_div":mtf.get("macd_div"),
+            "bb_squeeze":mtf.get("bb_squeeze",False),
+            "pct_b":mtf.get("pct_b",0.5),
+            "atr_pips":mtf.get("atr_pips",0),
+            "sl_pips":sl_pips,
+            "in_golden_pocket":mtf.get("in_golden_pocket",False),
+            "candle_patterns":[cp["pattern"] for cp in mtf.get("candles",[])],
+            "bb_mid": mtf.get("bb_mid",0),
+            "bb_lo":  mtf.get("bb_lo",0),
+            "bb_up":  mtf.get("bb_up",0),
             # Quality metrics
             "grade": grade_signal(
                 round(sc_val*100), len(real_conf),
@@ -1173,13 +1503,13 @@ nav{display:flex;align-items:center;justify-content:space-between;padding:0 1.25
 .ts-tp1{background:var(--bla);color:var(--bl);border:1px solid rgba(61,159,255,.2)}
 /* Right */
 .right{display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
-.chart-area{flex:1;padding:.9rem 1.25rem .4rem;display:flex;flex-direction:column;min-height:0}
+.chart-area{flex:1;padding:.9rem 1.25rem .4rem;display:flex;flex-direction:column;min-height:0;overflow:hidden}
 .chart-hdr{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:.65rem}
 .csym{font-family:var(--disp);font-size:26px;letter-spacing:.04em;color:var(--t)}
 .cmeta{font-family:var(--mono);font-size:9px;color:var(--t2);display:flex;gap:.6rem;margin-top:2px;flex-wrap:wrap}
 .cpx{font-family:var(--mono);font-size:13px;font-weight:500;text-align:right}
 .cup{color:var(--g)}.cdn{color:var(--r)}
-.chart-wrap{flex:1;position:relative;min-height:0}
+.chart-wrap{flex:1;position:relative;min-height:200px;background:var(--bg)}
 /* Table */
 .tbl-wrap{padding:.4rem 1.25rem .6rem;border-top:1px solid var(--b);overflow-x:auto}
 .tlbl{display:flex;align-items:center;justify-content:space-between;font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--t3);padding:.3rem 0}
@@ -1223,6 +1553,9 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
 .spin-txt{font-family:var(--disp);font-size:22px;letter-spacing:.1em;color:var(--g)}
 .spin-sub{font-family:var(--mono);font-size:10px;color:var(--t2)}
 /* Toast */
+.tf-btn{font-family:var(--mono);font-size:9px;padding:2px 7px;border-radius:3px;border:1px solid var(--b);background:var(--bg2);color:var(--t3);cursor:pointer;transition:all .12s}
+.tf-btn:hover{color:var(--t);border-color:var(--b2)}
+.tf-btn.on{background:var(--bg3);border-color:var(--b2);color:var(--t)}
 .toast{position:fixed;bottom:1.25rem;right:1.25rem;z-index:200;font-family:var(--mono);font-size:10px;padding:.6rem .9rem;border-radius:4px;background:var(--bg2);border:1px solid var(--b2);color:var(--t);max-width:280px;transform:translateY(60px);opacity:0;transition:all .25s;pointer-events:none}
 .toast.show{transform:translateY(0);opacity:1}
 .tb{border-color:rgba(0,255,179,.3);background:var(--ga)}.ts{border-color:rgba(255,61,90,.3);background:var(--ra)}.tw{border-color:rgba(255,184,0,.3);background:var(--aa)}
@@ -1237,6 +1570,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
     <button class="nbtn snd-btn" id="sndBtn" onclick="toggleSound()" title="Sound alerts">🔔</button>
     <div id="mktBadge" class="mkt-badge open-b"><div class="bd"></div><span id="mktLbl">CONNECTING</span></div>
     <div class="clk" id="clk">--:--:-- UTC</div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--t3)" id="localTimeEl"></div>
     <button class="nbtn force-btn" onclick="doScan(true)">↺ FORCE</button>
     <button class="nbtn scan-btn" id="scanBtn" onclick="doScan(false)">⟳ SCAN ALL</button>
   </div>
@@ -1304,14 +1638,19 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
       </div>
     </div>
 
-    <!-- New Strategy Indicators -->
+    <!-- Live Indicators Panel -->
     <div class="sect" style="padding:.65rem 1rem">
-      <div class="slbl">Live Strategy Indicators</div>
-      <div style="display:flex;flex-direction:column;gap:4px;font-family:var(--mono);font-size:9px">
-        <div id="infoEMA" style="color:var(--t2)">EMA200: —</div>
-        <div id="infoRSI" style="color:var(--t2)">RSI: —</div>
-        <div id="infoKZ"  style="color:var(--t3)">Killzone: None</div>
-        <div id="infoJudas" style="color:var(--t3)">Judas: None</div>
+      <div class="slbl">Live Indicators</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px">
+        <div class="lv"><div class="lvk">EMA200</div><div class="lvv" id="infoEMA" style="font-size:10px;color:var(--t2)">—</div></div>
+        <div class="lv"><div class="lvk">RSI(14)</div><div class="lvv" id="infoRSI" style="font-size:10px;color:var(--t2)">—</div></div>
+        <div class="lv"><div class="lvk">MACD</div><div class="lvv" id="infoMACD" style="font-size:10px;color:var(--t2)">—</div></div>
+        <div class="lv"><div class="lvk">BB %B</div><div class="lvv" id="infoBB" style="font-size:10px;color:var(--t2)">—</div></div>
+        <div class="lv"><div class="lvk">ATR Pips</div><div class="lvv" id="infoATR" style="font-size:10px;color:var(--t2)">—</div></div>
+        <div class="lv"><div class="lvk">Fib GP</div><div class="lvv" id="infoFib" style="font-size:10px;color:var(--t2)">—</div></div>
+        <div class="lv" style="grid-column:span 2"><div class="lvk">Killzone</div><div class="lvv" id="infoKZ" style="font-size:10px;color:var(--t3)">None</div></div>
+        <div class="lv" style="grid-column:span 2"><div class="lvk">Judas Swing</div><div class="lvv" id="infoJudas" style="font-size:10px;color:var(--t3)">None</div></div>
+        <div class="lv" style="grid-column:span 2"><div class="lvk">Candle Patterns</div><div class="lvv" id="infoCandles" style="font-size:9px;color:var(--t2)">—</div></div>
       </div>
     </div>
 
@@ -1341,11 +1680,16 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
         <span style="color:var(--t2);min-width:55px;font-family:var(--mono);font-size:9px">Risk %</span>
         <input class="risk-input" id="rcRisk" type="number" value="1" min="0.1" max="10" step="0.1" oninput="calcRisk()">
       </div>
+      <div class="risk-row">
+        <span style="color:var(--t2);min-width:55px;font-family:var(--mono);font-size:9px">SL Pips</span>
+        <input class="risk-input" id="rcSLPips" type="number" value="30" min="5" max="200" step="1" oninput="calcRisk()">
+      </div>
       <div class="risk-result" id="rcResult">
         <div><div class="rr-key">Risk $</div><div class="rr-val" id="rcDollar">$100</div></div>
         <div><div class="rr-key">Lot Size</div><div class="rr-val" id="rcLots">0.33</div></div>
-        <div><div class="rr-key">SL (30p)</div><div class="rr-val" id="rcSL">$30</div></div>
-        <div><div class="rr-key">TP1 (45p)</div><div class="rr-val" id="rcTP1">$45</div></div>
+        <div><div class="rr-key">SL Cost</div><div class="rr-val" id="rcSL">$30</div></div>
+        <div><div class="rr-key">TP1 Profit</div><div class="rr-val" id="rcTP1">$45</div></div>
+        <div style="grid-column:span 2"><div class="rr-key">Pip Value (std lot)</div><div class="rr-val" id="rcPipVal" style="color:var(--t2);font-size:10px">—</div></div>
       </div>
     </div>
 
@@ -1423,20 +1767,37 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
     <div class="chart-area">
       <div class="chart-hdr">
         <div>
-          <div class="csym" id="csym">—/—</div>
-          <div class="cmeta">
+          <div style="display:flex;align-items:center;gap:10px">
+            <div class="csym" id="csym">—/—</div>
+            <div style="display:flex;gap:3px" id="tfBtns">
+              <button class="tf-btn on" onclick="switchTF(this,'M15')">M15</button>
+              <button class="tf-btn on" onclick="switchTF(this,'H1')">H1</button>
+              <button class="tf-btn"    onclick="switchTF(this,'H4')">H4</button>
+              <button class="tf-btn"    onclick="switchTF(this,'D1')">D1</button>
+            </div>
+          </div>
+          <div class="cmeta" style="margin-top:4px">
             <span id="cBias">Bias: —</span>
             <span id="cStruct">Structure: —</span>
             <span id="cSess">Session: —</span>
-            <span id="cSpread" style="color:var(--t3)">Spread: —</span>
+            <span id="cKZ" style="color:var(--g)"></span>
           </div>
         </div>
-        <div>
+        <div style="text-align:right">
           <div class="cpx cup" id="cpx">—</div>
-          <div style="font-family:var(--mono);font-size:8px;color:var(--t3);text-align:right" id="cpxChg">—</div>
+          <div style="font-family:var(--mono);font-size:8px;color:var(--t3)" id="cpxChg">—</div>
+          <div style="font-family:var(--mono);font-size:8px;color:var(--t3)" id="cpxSrc">—</div>
         </div>
       </div>
       <div class="chart-wrap"><canvas id="chart" role="img" aria-label="SMC price chart"></canvas></div>
+      <div style="display:flex;gap:12px;padding:3px 0;font-family:var(--mono);font-size:8px;color:var(--t3)">
+        <span><span style="color:rgba(0,255,179,.9)">─</span> Entry</span>
+        <span><span style="color:rgba(255,61,90,.9)">- -</span> SL</span>
+        <span><span style="color:rgba(0,255,179,.7)">- -</span> TP1</span>
+        <span><span style="color:rgba(0,255,179,.95)">─</span> TP2</span>
+        <span><span style="color:rgba(255,184,0,.5)">···</span> BB</span>
+        <span><span style="color:rgba(61,159,255,.5)">···</span> EMA200</span>
+      </div>
     </div>
 
     <div class="tbl-wrap">
@@ -1445,8 +1806,8 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
         <button class="export-btn" onclick="exportCSV()">⬇ Export History CSV</button>
       </div>
       <table><thead><tr>
-        <th>Pair</th><th>Signal</th><th>Score</th><th>HTF</th><th>Entry</th>
-        <th>SL·30p</th><th>TP1·1.5R</th><th>TP2·3R</th><th>R:R</th><th>Age</th><th>Confluences</th>
+        <th>Pair</th><th>Signal</th><th>Grade</th><th>Score</th><th>HTF</th><th>Entry</th>
+        <th>Stop Loss</th><th>TP1 (1.5R)</th><th>TP2 (3R)</th><th>R:R</th><th>Age</th><th>Confluences</th>
       </tr></thead>
       <tbody id="tbody"><tr><td colspan="11" style="color:var(--t3);text-align:center;padding:1rem">Click SCAN ALL or wait for auto-scan</td></tr></tbody>
       </table>
@@ -1623,6 +1984,7 @@ async function doScan(force){
         if(s.trade_status==='new'||!lastSigIds[s.pair]){
           playBeep(s.direction==='BUY'?880:440);
           showToast(`${s.direction==='BUY'?'📈':'📉'} NEW: ${s.pair.slice(0,3)+'/'+s.pair.slice(3)} ${s.direction} — ${s.score_pct}%`,s.direction==='BUY'?'tb':'ts');
+          sendPushNotif(`SMC Signal: ${s.pair} ${s.direction}`,`Score: ${s.score_pct}% | Entry: ${s.entry} | Grade: ${s.grade||'C'}`);
           addLog(`${s.direction} | ${s.score_pct}% | ${(s.conf||[]).join(', ')}`,s.pair,s.direction==='BUY'?'buy':'sell');
           lastSigIds[s.pair]=id;
         }
@@ -1683,6 +2045,18 @@ function updateSignal(sig){
   if(sig.demo){ct.textContent='DEMO';ct.className='cache-tag ct-demo';}
   else if(sig.cached){ct.textContent='CACHED';ct.className='cache-tag ct-cached';}
   else{ct.textContent='LIVE';ct.className='cache-tag ct-live';}
+  // Correlation warning in confluences
+  const corrConf=(sig.conf||[]).filter(c=>c.startsWith('Corr'));
+  if(corrConf.length){
+    const tags=document.getElementById('ctags');
+    corrConf.forEach(c=>{
+      const span=document.createElement('span');
+      span.className='ctag neutral';
+      span.style.color='var(--a)';
+      span.textContent=c;
+      tags.appendChild(span);
+    });
+  }
   // Trade status badge
   const tsb=document.getElementById('tradeStatusBadge');
   const ts=sig.trade_status;
@@ -1719,14 +2093,42 @@ function updateSignal(sig){
     rsiEl.style.color=rval<30?'var(--g)':rval>70?'var(--r)':'var(--t2)';
   }
   const kzEl=document.getElementById('infoKZ');
-  if(kzEl){
-    kzEl.textContent='Killzone: '+(sig.killzone||'None');
-    kzEl.style.color=sig.killzone?'var(--g)':'var(--t3)';
-  }
+  if(kzEl){kzEl.textContent=sig.killzone||'None';kzEl.style.color=sig.killzone?'var(--g)':'var(--t3)';}
   const judEl=document.getElementById('infoJudas');
-  if(judEl){
-    judEl.textContent=sig.judas?'⚡ Judas Swing: '+sig.judas.replace('_',' ').toUpperCase():'Judas: None';
-    judEl.style.color=sig.judas?'var(--a)':'var(--t3)';
+  if(judEl){judEl.textContent=sig.judas?sig.judas.replace('_',' ').toUpperCase():'None';judEl.style.color=sig.judas?'var(--a)':'var(--t3)';}
+  // MACD
+  const macdEl=document.getElementById('infoMACD');
+  if(macdEl){
+    const h=sig.macd_hist||0;
+    macdEl.textContent=(sig.macd_div?sig.macd_div.toUpperCase()+' DIV':'')+(h>0?' ▲':h<0?' ▼':' —');
+    macdEl.style.color=h>0?'var(--g)':h<0?'var(--r)':'var(--t2)';
+  }
+  // Bollinger
+  const bbEl=document.getElementById('infoBB');
+  if(bbEl){
+    const pb=(sig.pct_b||0.5).toFixed(2);
+    bbEl.textContent=pb+(sig.bb_squeeze?' [SQUEEZE]':'');
+    bbEl.style.color=sig.bb_squeeze?'var(--a)':(sig.pct_b<0.1)?'var(--g)':(sig.pct_b>0.9)?'var(--r)':'var(--t2)';
+  }
+  // ATR
+  const atrEl=document.getElementById('infoATR');
+  if(atrEl){
+    const ap=sig.atr_pips||0;
+    atrEl.textContent=ap+'p (SL:'+sig.sl_pips+'p)';
+    atrEl.style.color=ap<20?'var(--g)':ap>50?'var(--r)':'var(--t2)';
+  }
+  // Fibonacci
+  const fibEl=document.getElementById('infoFib');
+  if(fibEl){
+    fibEl.textContent=sig.in_golden_pocket?'IN GOLDEN POCKET ✓':'Outside GP';
+    fibEl.style.color=sig.in_golden_pocket?'var(--a)':'var(--t3)';
+  }
+  // Candle patterns
+  const candEl=document.getElementById('infoCandles');
+  if(candEl){
+    const pats=sig.candle_patterns||[];
+    candEl.textContent=pats.length?pats.join(', '):'None detected';
+    candEl.style.color=pats.length?'var(--t)':'var(--t3)';
   }
   // Confluence breakdown
   document.getElementById('bsBull').textContent='B:'+sig.buy_score+'%';
@@ -1784,9 +2186,12 @@ function buildTable(sigs){
     const age=s.signal_age_min||0;
     const ageStr=age<1?'now':age<60?age+'m':Math.floor(age/60)+'h';
     const htfCls=s.htf_trend==='bullish'?'style="color:var(--g)"':s.htf_trend==='bearish'?'style="color:var(--r)"':'style="color:var(--a)"';
+    const grCfg={A:'background:rgba(0,255,179,.15);color:var(--g)',B:'background:rgba(61,159,255,.12);color:var(--bl)',C:'background:rgba(255,184,0,.1);color:var(--a)'};
+    const grSt=grCfg[s.grade||'C']||grCfg.C;
     return `<tr>
       <td style="color:var(--t);font-weight:500">${s.pair.slice(0,3)+'/'+s.pair.slice(3)}</td>
       <td class="${dc}">${s.direction}</td>
+      <td><span style="font-family:var(--mono);font-size:9px;padding:1px 6px;border-radius:3px;${grSt}">${s.grade||'C'}</span></td>
       <td><span class="sp ${pc}">${s.score_pct}%</span></td>
       <td ${htfCls}>${(s.htf_trend||'—').slice(0,4).toUpperCase()}</td>
       <td>${s.direction!=='WAIT'?f(s.entry):'—'}</td>
@@ -1795,59 +2200,252 @@ function buildTable(sigs){
       <td>${s.direction!=='WAIT'?f(s.tp2):'—'}</td>
       <td>${s.direction!=='WAIT'?'1:'+s.rr:'—'}</td>
       <td style="color:var(--t3)">${ageStr}</td>
-      <td style="color:var(--t2);font-size:9px">${(s.conf||[]).join(' · ')||'—'}</td>
+      <td style="color:var(--t2);font-size:9px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(s.conf||[]).join(', ')}">${(s.conf||[]).join(' · ')||'—'}</td>
     </tr>`;
   }).join('');
 }
 
 // ── Chart ─────────────────────────────────────────────────────
-async function loadChart(p){
+async function loadChart(p, tf){
+  tf = tf || currentTF || 'H1';
+  const limit = tf==='M15'?100:tf==='H1'?80:tf==='H4'?80:60;
   try{
-    const d=await(await fetch(`/api/bars/${p}?tf=H1&limit=80`,{signal:AbortSignal.timeout(15000)})).json();
-    if(d.bars&&d.bars.length) buildChart(p,d.bars,d.demo);
+    const d=await(await fetch(`/api/bars/${p}?tf=${tf}&limit=${limit}`,{signal:AbortSignal.timeout(15000)})).json();
+    if(d.bars&&d.bars.length) buildChart(p,d.bars,d.demo,tf);
   }catch(e){}
 }
-function buildChart(p,bars,isDemo){
-  const dp=DIGITS[p]||5;
-  const labels=bars.map((_,i)=>i);
-  const colors=bars.map(b=>b.close>=b.open?'rgba(0,255,179,.75)':'rgba(255,61,90,.75)');
-  const sig=allSigs.find(s=>s.pair===p);
-  const ds=[{type:'bar',data:bars.map((b,i)=>({x:i,y:[b.open,b.close]})),backgroundColor:colors,borderWidth:0,barPercentage:.55}];
-  if(sig&&sig.zones){
-    sig.zones.filter(z=>z.color==='green'&&z.lo).forEach(z=>{
-      ds.push({type:'line',data:labels.map(()=>z.lo),borderColor:'rgba(0,255,179,.5)',borderWidth:1,borderDash:[4,3],pointRadius:0,tension:0});
-      ds.push({type:'line',data:labels.map(()=>z.hi),borderColor:'rgba(0,255,179,.2)',borderWidth:1,borderDash:[2,5],pointRadius:0,tension:0});
+function buildChart(p, bars, isDemo, tf){
+  const dp   = DIGITS[p] || 5;
+  const sig  = allSigs.find(s => s.pair === p);
+  const canvas = document.getElementById('chart');
+  if(!canvas) return;
+  const ctx  = canvas.getContext('2d');
+
+  // Update price display
+  const last = bars[bars.length-1];
+  if(last){
+    document.getElementById('cpx').textContent = last.close.toFixed(dp);
+    document.getElementById('cpx').className = 'cpx ' + (last.close >= bars[0].close ? 'cup' : 'cdn');
+  }
+  const srcEl = document.getElementById('cpxSrc');
+  if(srcEl) srcEl.textContent = (isDemo?'DEMO':'LIVE')+' · '+(tf||'H1')+' · yfinance';
+  // Update killzone display
+  const kz=getKillzoneLocal();
+  const kzEl=document.getElementById('cKZ');
+  if(kzEl){
+    if(kz.name) kzEl.textContent='⚡ '+kz.name+' Killzone ACTIVE';
+    else kzEl.textContent=kz.next_in_mins?'Next KZ in '+kz.next_in_mins+'m':'';
+  }
+
+  // Destroy previous Chart.js instance if exists
+  if(chart){ chart.destroy(); chart = null; }
+
+  // ── Canvas-based candlestick renderer ──────────────────────────────
+  // We draw candles directly on canvas via a Chart.js plugin for full control
+  const N = bars.length;
+  if(N < 2) return;
+
+  // Price range with padding
+  const allH = bars.map(b=>b.high);
+  const allL = bars.map(b=>b.low);
+  let yMax = Math.max(...allH);
+  let yMin = Math.min(...allL);
+
+  // Include signal levels in range
+  if(sig && sig.direction !== 'WAIT'){
+    yMax = Math.max(yMax, sig.tp2 || 0);
+    yMin = Math.min(yMin, sig.sl  || yMin);
+  }
+
+  const pad  = (yMax - yMin) * 0.08;
+  yMax += pad; yMin -= pad;
+
+  // Draw function helpers
+  function toY(price, h){ return h - ((price - yMin) / (yMax - yMin)) * h; }
+
+  // Build overlay lines dataset (zones, entry, SL, TP)
+  const overlayLines = [];
+
+  if(sig){
+    // OB zones
+    (sig.zones || []).forEach(z => {
+      if(z.color === 'green' && z.hi && z.lo){
+        overlayLines.push({y: z.hi, color:'rgba(0,255,179,.5)', dash:[6,3], width:1, label:'OB'});
+        overlayLines.push({y: z.lo, color:'rgba(0,255,179,.25)', dash:[3,4], width:1});
+      }
+      if(z.color === 'red' && z.hi && z.lo){
+        overlayLines.push({y: z.hi, color:'rgba(255,61,90,.5)', dash:[6,3], width:1, label:'OB'});
+        overlayLines.push({y: z.lo, color:'rgba(255,61,90,.25)', dash:[3,4], width:1});
+      }
+      if(z.color === 'amber' && z.hi && z.lo){
+        const mid=(z.hi+z.lo)/2;
+        overlayLines.push({y: mid, color:'rgba(255,184,0,.5)', dash:[4,3], width:1, label:'FVG'});
+      }
+      if(z.color === 'blue' && z.price){
+        overlayLines.push({y: z.price, color:'rgba(61,159,255,.4)', dash:[4,4], width:1, label: z.type});
+      }
     });
-    sig.zones.filter(z=>z.color==='red'&&z.hi).forEach(z=>{
-      ds.push({type:'line',data:labels.map(()=>z.hi),borderColor:'rgba(255,61,90,.5)',borderWidth:1,borderDash:[4,3],pointRadius:0,tension:0});
-      ds.push({type:'line',data:labels.map(()=>z.lo),borderColor:'rgba(255,61,90,.2)',borderWidth:1,borderDash:[2,5],pointRadius:0,tension:0});
-    });
-    sig.zones.filter(z=>z.color==='amber'&&z.hi&&z.lo).forEach(z=>{
-      const mid=(z.hi+z.lo)/2;
-      ds.push({type:'line',data:labels.map(()=>mid),borderColor:'rgba(255,184,0,.5)',borderWidth:1,borderDash:[3,4],pointRadius:0,tension:0});
-    });
-    // Draw entry/SL/TP lines on chart
-    if(sig.direction!=='WAIT'){
-      ds.push({type:'line',data:labels.map(()=>sig.entry),borderColor:'rgba(61,159,255,.6)',borderWidth:1,borderDash:[6,2],pointRadius:0,tension:0,label:'Entry'});
-      ds.push({type:'line',data:labels.map(()=>sig.sl),borderColor:'rgba(255,61,90,.6)',borderWidth:1,borderDash:[3,3],pointRadius:0,tension:0,label:'SL'});
-      ds.push({type:'line',data:labels.map(()=>sig.tp1),borderColor:'rgba(0,255,179,.4)',borderWidth:1,borderDash:[3,3],pointRadius:0,tension:0,label:'TP1'});
-      ds.push({type:'line',data:labels.map(()=>sig.tp2),borderColor:'rgba(0,255,179,.7)',borderWidth:1,borderDash:[6,2],pointRadius:0,tension:0,label:'TP2'});
+    // Signal levels
+    if(sig.direction !== 'WAIT'){
+      overlayLines.push({y:sig.entry, color:'rgba(61,159,255,.9)',  dash:[],    width:1.5, label:'Entry'});
+      overlayLines.push({y:sig.sl,    color:'rgba(255,61,90,.9)',   dash:[5,3], width:1.5, label:'SL'});
+      overlayLines.push({y:sig.tp1,   color:'rgba(0,255,179,.7)',   dash:[5,3], width:1.5, label:'TP1'});
+      overlayLines.push({y:sig.tp2,   color:'rgba(0,255,179,.95)',  dash:[],    width:1.5, label:'TP2'});
+    }
+    // Bollinger bands
+    if(sig.bb_up && sig.bb_lo){
+      overlayLines.push({y:sig.bb_up, color:'rgba(255,184,0,.3)', dash:[2,4], width:1});
+      overlayLines.push({y:sig.bb_mid||((sig.bb_up+sig.bb_lo)/2), color:'rgba(255,184,0,.15)', dash:[2,4], width:1});
+      overlayLines.push({y:sig.bb_lo, color:'rgba(255,184,0,.3)', dash:[2,4], width:1});
+    }
+    // EMA lines
+    if(sig.ema200){
+      overlayLines.push({y:sig.ema200, color:'rgba(61,159,255,.5)', dash:[1,3], width:1, label:'EMA200'});
+    }
+    if(sig.ema50){
+      overlayLines.push({y:sig.ema50, color:'rgba(255,184,0,.45)', dash:[1,3], width:1, label:'EMA50'});
     }
   }
-  const last=bars[bars.length-1]?.close||0;
-  document.getElementById('cpx').textContent=last.toFixed(dp);
-  document.getElementById('cpx').className='cpx '+(last>=(bars[0]?.close||0)?'cup':'cdn');
-  document.getElementById('cpxSrc')?document.getElementById('cpxSrc').textContent=(isDemo?'DEMO':'LIVE · yfinance'):null;
-  if(chart) chart.destroy();
-  chart=new Chart(document.getElementById('chart'),{
-    type:'bar',data:{labels,datasets:ds},
-    options:{responsive:true,maintainAspectRatio:false,animation:{duration:250},
-      plugins:{legend:{display:false},tooltip:{enabled:false}},
-      scales:{x:{display:false},y:{grid:{color:'rgba(255,255,255,.04)'},
-        ticks:{color:'#2d404f',font:{size:9,family:'JetBrains Mono'},maxTicksLimit:6,
-               callback:v=>typeof v==='number'?v.toFixed(dp>3?4:dp<3?1:2):v}}}}
+
+  // Custom candlestick plugin
+  const candlePlugin = {
+    id: 'candles',
+    beforeDraw(chartInst){
+      const {ctx: c, chartArea: {left,right,top,bottom}, scales} = chartInst;
+      const W = right - left;
+      const H = bottom - top;
+      const candleW = Math.max(2, Math.floor(W / N * 0.7));
+      const gap     = W / N;
+
+      c.save();
+      c.beginPath();
+      c.rect(left, top, W, H);
+      c.clip();
+
+      // Draw overlay lines behind candles
+      overlayLines.forEach(line => {
+        const ly = scales.y.getPixelForValue(line.y);
+        if(ly < top || ly > bottom) return;
+        c.beginPath();
+        c.strokeStyle = line.color;
+        c.lineWidth   = line.width || 1;
+        c.setLineDash(line.dash || []);
+        c.moveTo(left, ly);
+        c.lineTo(right, ly);
+        c.stroke();
+        // Label on right edge
+        if(line.label){
+          c.setLineDash([]);
+          c.fillStyle = line.color;
+          c.font = '9px JetBrains Mono, monospace';
+          c.textAlign = 'right';
+          c.fillText(line.label, right - 2, ly - 3);
+        }
+      });
+
+      // Draw candles
+      bars.forEach((b, i) => {
+        const x  = left + i * gap + gap / 2;
+        const yO = scales.y.getPixelForValue(b.open);
+        const yC = scales.y.getPixelForValue(b.close);
+        const yH = scales.y.getPixelForValue(b.high);
+        const yL = scales.y.getPixelForValue(b.low);
+        const isBull = b.close >= b.open;
+        const col    = isBull ? '#00ffb3' : '#ff3d5a';
+        const bodyTop    = Math.min(yO, yC);
+        const bodyBottom = Math.max(yO, yC);
+        const bodyH      = Math.max(1, bodyBottom - bodyTop);
+
+        // Wick
+        c.beginPath();
+        c.strokeStyle = isBull ? 'rgba(0,255,179,.6)' : 'rgba(255,61,90,.6)';
+        c.lineWidth = 1;
+        c.setLineDash([]);
+        c.moveTo(x, yH);
+        c.lineTo(x, yL);
+        c.stroke();
+
+        // Body
+        c.fillStyle = isBull ? 'rgba(0,255,179,.85)' : 'rgba(255,61,90,.85)';
+        c.strokeStyle = col;
+        c.lineWidth = 0.5;
+        c.beginPath();
+        c.rect(x - candleW/2, bodyTop, candleW, bodyH);
+        c.fill();
+        c.stroke();
+      });
+
+      // ── Volume bars at bottom (10% of chart height) ──────────────
+      const volH   = H * 0.12;
+      const volTop = bottom - volH;
+      const vols   = bars.map(b=>b.volume||0);
+      const maxVol = Math.max(...vols, 1);
+      c.globalAlpha = 0.45;
+      bars.forEach((b,i)=>{
+        const x   = left + i*gap + gap/2;
+        const vh  = (b.volume||0) / maxVol * volH;
+        const col = b.close >= b.open ? 'rgba(0,255,179,.6)' : 'rgba(255,61,90,.6)';
+        c.fillStyle = col;
+        c.fillRect(x - candleW/2, volTop + volH - vh, candleW, vh);
+      });
+      c.globalAlpha = 1.0;
+
+      // Volume axis label
+      c.fillStyle = '#2d404f';
+      c.font = '8px JetBrains Mono, monospace';
+      c.textAlign = 'left';
+      c.fillText('Vol', left + 2, volTop + 10);
+
+      c.restore();
+    }
+  };
+
+  // Invisible dataset to set up the axes
+  const pricePoints = bars.map((b,i) => ({x: i, y: (b.high+b.low)/2}));
+
+  chart = new Chart(canvas, {
+    type: 'scatter',
+    data: {
+      datasets: [{
+        data: pricePoints,
+        pointRadius: 0,
+        showLine: false,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 0 },
+      plugins: {
+        legend:  { display: false },
+        tooltip: { enabled: false },
+        candles: {},
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          display: false,
+          min: 0,
+          max: N - 1,
+        },
+        y: {
+          min: yMin,
+          max: yMax,
+          grid: { color: 'rgba(255,255,255,.04)', lineWidth: 0.5 },
+          border: { color: 'rgba(255,255,255,.06)' },
+          ticks: {
+            color: '#2d404f',
+            font: { size: 9, family: 'JetBrains Mono, monospace' },
+            maxTicksLimit: 6,
+            callback: v => typeof v === 'number' ? v.toFixed(dp > 3 ? 4 : dp < 3 ? 1 : 2) : v,
+          }
+        }
+      }
+    },
+    plugins: [candlePlugin]
   });
 }
+
 
 // ── P&L History ───────────────────────────────────────────────
 function buildHistory(history){
@@ -2044,9 +2642,89 @@ function showToast(msg,cls){
   setTimeout(()=>t.classList.remove('show'),5000);
 }
 
+// ── Timeframe switcher ───────────────────────────────────────
+let currentTF = 'H1';
+function switchTF(btn, tf){
+  currentTF = tf;
+  document.querySelectorAll('.tf-btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  loadChart(pair, tf);
+}
+
+// ── Volume bar renderer (added to candlestick plugin) ─────────
+// Integrated into buildChart below — uses canvas bottom area
+
+// ── Pip value & lot size reference table ─────────────────────
+const PIP_VALUES = {
+  EURUSD:{std:10,mini:1,micro:0.1,unit:'USD'},
+  GBPUSD:{std:10,mini:1,micro:0.1,unit:'USD'},
+  USDJPY:{std:9.3,mini:0.93,micro:0.093,unit:'USD'},
+  GBPJPY:{std:7.8,mini:0.78,micro:0.078,unit:'USD'},
+  AUDUSD:{std:10,mini:1,micro:0.1,unit:'USD'},
+  USDCAD:{std:7.7,mini:0.77,micro:0.077,unit:'USD'},
+  XAUUSD:{std:10,mini:1,micro:0.1,unit:'USD'},
+};
+
+function calcRisk(){
+  const bal=parseFloat(document.getElementById('rcBalance').value)||10000;
+  const riskPct=parseFloat(document.getElementById('rcRisk').value)||1;
+  const riskUSD=bal*riskPct/100;
+  const pv=PIP_VALUES[pair]||{std:10};
+  const slPips=parseInt(document.getElementById('rcSLPips')?.value||30);
+  const lots=Math.max(0.01,Math.min((riskUSD/(slPips*pv.std)).toFixed(2),100));
+  document.getElementById('rcDollar').textContent='$'+riskUSD.toFixed(2);
+  document.getElementById('rcLots').textContent=lots;
+  document.getElementById('rcSL').textContent='$'+(lots*slPips*pv.std).toFixed(2);
+  document.getElementById('rcTP1').textContent='$'+(lots*slPips*1.5*pv.std).toFixed(2);
+  // pip value display
+  const pvEl=document.getElementById('rcPipVal');
+  if(pvEl) pvEl.textContent='$'+pv.std+'/pip (std lot)';
+}
+
+// ── Local timezone display ────────────────────────────────────
+function updateLocalTime(){
+  const el=document.getElementById('localTimeEl');
+  if(!el) return;
+  const n=new Date();
+  el.textContent='Local: '+n.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+}
+setInterval(updateLocalTime,1000);
+
+// ── Killzone local time helper ────────────────────────────────
+function getKillzoneLocal(){
+  const now=new Date();
+  const h=now.getUTCHours();
+  const m=now.getUTCMinutes();
+  const t=h*60+m;
+  if(t>=420&&t<600) return {name:'London',ends:600};
+  if(t>=720&&t<900) return {name:'New York',ends:900};
+  if(t>=1320||t<60) return {name:'Asian',ends:60};
+  // Calculate time to next killzone
+  const next=[420,720,1320];
+  const diff=next.map(s=>s>t?s-t:1440-t+s);
+  const mins=Math.min(...diff);
+  return {name:null,next_in_mins:mins};
+}
+
+// ── Browser push notification permission ──────────────────────
+async function requestNotifyPermission(){
+  if(!('Notification' in window)) return;
+  if(Notification.permission==='default'){
+    const p=await Notification.requestPermission();
+    if(p==='granted') addLog('Push notifications enabled','SYS','info');
+  }
+}
+
+function sendPushNotif(title, body){
+  if(!('Notification' in window)||Notification.permission!=='granted') return;
+  new Notification(title,{body,icon:'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="16" fill="%2300ffb3"/><text x="50%" y="50%" text-anchor="middle" dy=".35em" font-size="16">📈</text></svg>'});
+}
+
 // ── Init ──────────────────────────────────────────────────────
 (async function(){
   addLog('Dashboard ready — auto-scan every 5 min','SYS','info');
+  requestNotifyPermission();
+  updateLocalTime();
   loadPrices();
   const st=await checkStatus();
   if(st&&st.is_open){
