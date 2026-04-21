@@ -96,6 +96,41 @@ RISK_CONFIG = {
     "pairs":             ["EURUSD", "GBPUSD", "USDJPY", "GBPJPY", "AUDUSD", "XAUUSD"],
 }
 
+# ── Signal cache — locked to real candle data, never random ──────────
+_signal_cache: dict  = {}          # { pair: signal_dict }
+_signal_cache_ts: float = 0.0      # when cache was last populated
+_signal_cache_bars: dict = {}      # { pair_tf: last bar timestamp }
+SIGNAL_TTL = 3600                  # re-analyse after 1 hour max
+PRICE_MOVE_THRESHOLD = 0.0003      # re-analyse if price moves >0.03% (3 pips on EURUSD)
+
+def signal_is_stale(pair: str, current_price: float) -> bool:
+    """
+    Return True only if we should re-run SMC analysis.
+    Signals stay locked unless:
+      1. Cache is empty for this pair
+      2. A new H1 candle has closed (bar timestamp changed)
+      3. Price has moved more than the threshold since last analysis
+      4. TTL expired (1 hour safety net)
+    """
+    cached = _signal_cache.get(pair)
+    if not cached:
+        return True  # never analysed
+
+    age = time.time() - _signal_cache_ts
+    if age > SIGNAL_TTL:
+        return True  # too old
+
+    # Check if price moved significantly
+    last_price = cached.get("price", 0)
+    if last_price > 0:
+        move = abs(current_price - last_price) / last_price
+        if move > PRICE_MOVE_THRESHOLD:
+            log.info(f"{pair}: price moved {move:.4%} — refreshing signal")
+            return True
+
+    return False  # signal is still valid, keep it
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  MARKET HOURS
 # ══════════════════════════════════════════════════════════════════════
@@ -246,28 +281,45 @@ def fetch_live_prices() -> dict:
 
 
 def fetch_demo_bars(pair: str, n: int = 80) -> list:
+    """
+    Generate demo bars anchored to the real latest price.
+    Uses a FIXED seed = pair_name + today's date so bars are
+    identical on every call within the same day — no random flipping.
+    """
     import random
     prices = fetch_live_prices()
     base = prices.get(pair, {}).get("price", 0)
-    fallback = {"EURUSD":1.0855,"GBPUSD":1.2685,"USDJPY":149.82,"GBPJPY":192.30,"AUDUSD":0.6512,"USDCAD":1.3810,"XAUUSD":2321.0}
+    fallback = {"EURUSD":1.0855,"GBPUSD":1.2685,"USDJPY":149.82,
+                "GBPJPY":192.30,"AUDUSD":0.6512,"USDCAD":1.3810,"XAUUSD":2321.0}
     if base == 0:
         base = fallback.get(pair, 1.0)
-    vol_map = {"EURUSD":0.0008,"GBPUSD":0.0012,"USDJPY":0.12,"GBPJPY":0.18,"AUDUSD":0.0007,"USDCAD":0.0009,"XAUUSD":2.8}
+
+    vol_map = {"EURUSD":0.0008,"GBPUSD":0.0012,"USDJPY":0.12,
+               "GBPJPY":0.18,"AUDUSD":0.0007,"USDCAD":0.0009,"XAUUSD":2.8}
     vol = vol_map.get(pair, base * 0.001)
-    rng = random.Random(int(time.time() / 3600))
-    bars = []
-    price = base * (1 + rng.uniform(-0.003, 0.003))
+
+    # Seed = pair name + today's date → same every call, changes only at midnight
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    seed  = int(today) + sum(ord(c) * (i+1) for i, c in enumerate(pair))
+    rng   = random.Random(seed)
+
+    bars  = []
+    price = base * (1 + rng.uniform(-0.002, 0.002))  # tiny fixed offset
     for i in range(n):
-        drift = (base - price) * 0.03
+        drift = (base - price) * 0.04
         o = price
         c = o + drift + rng.gauss(0, vol)
-        h = max(o, c) + abs(rng.gauss(0, vol * 0.4))
-        l = min(o, c) - abs(rng.gauss(0, vol * 0.4))
-        bars.append({"time": int(time.time()) - (n - i) * 3600,
-                     "open": round(o, 5), "high": round(h, 5),
-                     "low": round(l, 5), "close": round(c, 5),
-                     "volume": rng.randint(500, 5000)})
+        h = max(o, c) + abs(rng.gauss(0, vol * 0.35))
+        l = min(o, c) - abs(rng.gauss(0, vol * 0.35))
+        bars.append({
+            "time":   int(time.time()) - (n - i) * 3600,
+            "open":   round(o, 5), "high": round(h, 5),
+            "low":    round(l, 5), "close": round(c, 5),
+            "volume": rng.randint(500, 5000),
+        })
         price = c
+
+    # Pin last bar to real current price
     if bars:
         bars[-1]["close"] = base
         bars[-1]["high"]  = max(bars[-1]["high"], base)
@@ -541,6 +593,41 @@ def api_config_set():
     return jsonify({"updated": updated, "errors": errors, "config": RISK_CONFIG})
 
 
+@app.route("/api/cache/clear", methods=["POST"])
+def api_cache_clear():
+    """Clear signal cache — forces full re-analysis on next scan."""
+    global _signal_cache, _signal_cache_ts
+    count = len(_signal_cache)
+    _signal_cache = {}
+    _signal_cache_ts = 0.0
+    log.info(f"Signal cache cleared ({count} entries)")
+    return jsonify({"message": f"Cleared {count} cached signals"})
+
+
+# ── Trade execution log (written by bridge, read by frontend) ────────
+_trade_log: list = []  # last 50 trade events
+
+@app.route("/api/trades", methods=["GET"])
+def api_trades_get():
+    """Frontend polls this to show live trade activity."""
+    return jsonify({"trades": _trade_log[-50:], "count": len(_trade_log)})
+
+
+@app.route("/api/trades", methods=["POST"])
+def api_trades_post():
+    """MT5 Bridge calls this to log a trade execution."""
+    global _trade_log
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "No body"}), 400
+    data["logged_at"] = datetime.now(timezone.utc).isoformat()
+    _trade_log.append(data)
+    _trade_log = _trade_log[-50:]  # keep last 50
+    log.info(f"Trade logged: {data.get('pair')} {data.get('direction')} "
+             f"ticket={data.get('ticket')} lots={data.get('lots')}")
+    return jsonify({"ok": True})
+
+
 @app.route("/api/config/reset", methods=["POST"])
 def api_config_reset():
     """Reset risk config to defaults."""
@@ -584,56 +671,110 @@ def api_bars(pair: str):
 
 @app.route("/api/scan")
 def api_scan():
+    global _signal_cache, _signal_cache_ts
     ms = market_status()
     if ms["is_closed"]:
-        # Market closed — fetch real latest prices and run SMC on demo bars
-        log.info("Market closed — fetching real latest prices for demo signals")
+        # Market closed — use cached signals if available, else generate from fixed demo bars
+        log.info("Market closed — checking signal cache")
         signals = []
+        needs_gen = []
+
+        # Check which pairs need generation
         for pair in PAIRS:
+            if pair in _signal_cache:
+                sig = _signal_cache[pair].copy()
+                sig["demo"] = True
+                sig["cached"] = True
+                signals.append(sig)
+                log.info(f"  Demo {pair}: CACHED {sig['direction']} {sig['score_pct']}%")
+            else:
+                needs_gen.append(pair)
+
+        # Generate only pairs not yet cached
+        for pair in needs_gen:
             try:
-                bars = fetch_demo_bars(pair, n=100)
+                bars = fetch_demo_bars(pair, n=100)  # fixed seed per day
                 if not bars:
                     continue
                 mtf = smc_analyse(bars, pair)
                 htf = smc_analyse(bars, pair)
                 ltf = smc_analyse(bars, pair)
                 sig = make_signal(pair, htf, mtf, ltf)
-                sig["demo"] = True
+                sig["demo"]   = True
+                sig["cached"] = False
+                _signal_cache[pair] = sig  # cache it
                 signals.append(sig)
-                log.info(f"  Demo {pair}: {sig['direction']} {sig['score_pct']}% price={sig['price']}")
+                log.info(f"  Demo {pair}: FRESH {sig['direction']} {sig['score_pct']}%")
             except Exception as e:
                 log.error(f"  Demo {pair}: {e}")
+
+        _signal_cache_ts = time.time()
         return jsonify({
             "market_closed": True,
-            "demo_mode": True,
-            "reason": ms["reason"],
-            "next_open": ms["next_open"],
+            "demo_mode":     True,
+            "reason":        ms["reason"],
+            "next_open":     ms["next_open"],
             "active_sessions": ms["active_sessions"],
             "server_time_utc": ms["server_time_utc"],
-            "weekday": ms["weekday"],
-            "signals": signals,
+            "weekday":       ms["weekday"],
+            "signals":       signals,
         })
-    signals = []
+    signals   = []
+    refreshed = []
+    cached_p  = []
+    live_prices = fetch_live_prices()
+
     for pair in PAIRS:
         try:
+            current_price = live_prices.get(pair, {}).get("price", 0)
+
+            # Return cached signal if price has not moved enough
+            if not signal_is_stale(pair, current_price) and pair in _signal_cache:
+                sig = _signal_cache[pair]
+                sig["cached"] = True
+                signals.append(sig)
+                cached_p.append(pair)
+                log.info(f"  {pair}: CACHED {sig['direction']} {sig['score_pct']}%")
+                continue
+
+            # Price moved or first run — re-analyse with real bars
             bh = fetch_bars(pair, "H4")
             bm = fetch_bars(pair, "H1")
             bl = fetch_bars(pair, "M15")
-            if not bm: continue
+            if not bm:
+                if pair in _signal_cache:
+                    signals.append(_signal_cache[pair])
+                    cached_p.append(pair)
+                continue
+
             htf = smc_analyse(bh or bm, pair)
             mtf = smc_analyse(bm, pair)
             ltf = smc_analyse(bl or bm, pair)
             sig = make_signal(pair, htf, mtf, ltf)
+            sig["cached"] = False
+            _signal_cache[pair] = sig
             signals.append(sig)
-            log.info(f"  {pair}: {sig['direction']} {sig['score_pct']}% | {sig['conf']}")
+            refreshed.append(pair)
+            log.info(f"  {pair}: FRESH {sig['direction']} {sig['score_pct']}%")
+
         except Exception as e:
             log.error(f"  {pair} error: {e}")
+            if pair in _signal_cache:
+                sig = _signal_cache[pair]
+                sig["cached"] = True
+                signals.append(sig)
+                cached_p.append(pair)
+
+    _signal_cache_ts = time.time()
+    log.info(f"Scan: {len(refreshed)} refreshed, {len(cached_p)} from cache")
     return jsonify({
-        "market_closed": False,
+        "market_closed":   False,
         "active_sessions": ms["active_sessions"],
         "server_time_utc": ms["server_time_utc"],
-        "signals": signals,
-        "scan_count": len(signals),
+        "signals":         signals,
+        "scan_count":      len(signals),
+        "refreshed":       refreshed,
+        "cached":          cached_p,
     })
 
 @app.route("/api/signal/<pair>")
@@ -808,6 +949,7 @@ input[type=range]{accent-color:var(--green);height:3px}
     <div id="mktBadge" class="status-badge badge-closed"><div class="badge-dot"></div><span id="mktLabel">CHECKING...</span></div>
     <div class="clock" id="clockEl">--:--:-- UTC</div>
     <button class="scan-btn" id="scanBtn" onclick="runScan()">⟳ SCAN ALL</button>
+    <button class="scan-btn" id="forceBtn" onclick="forceRescan()" style="background:transparent;color:var(--amber);border:0.5px solid rgba(255,184,0,.3);margin-left:4px" title="Clear cache and force full re-analysis">↺ FORCE</button>
   </div>
 </nav>
 <div style="background:var(--bg1);border-bottom:1px solid var(--border);overflow:hidden;height:28px;display:flex;align-items:center">
@@ -860,7 +1002,10 @@ input[type=range]{accent-color:var(--green);height:3px}
     </div>
     <div class="sect">
       <div class="sect-label">Active Signal</div>
-      <div class="sig-dir WAIT" id="sigDir">WAIT</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.3rem">
+        <div class="sig-dir WAIT" id="sigDir">WAIT</div>
+        <div id="cacheTag" style="font-family:var(--mono);font-size:9px;padding:2px 7px;border-radius:3px;background:var(--bg3);color:var(--text3);border:0.5px solid rgba(255,255,255,0.07)">—</div>
+      </div>
       <div class="lvl-grid">
         <div class="lvl"><div class="lvl-k">Entry</div><div class="lvl-v lv-e" id="lvE">—</div></div>
         <div class="lvl"><div class="lvl-k">Stop Loss</div><div class="lvl-v lv-s" id="lvS">—</div></div>
@@ -981,6 +1126,21 @@ input[type=range]{accent-color:var(--green);height:3px}
         <div style="font-family:var(--mono);font-size:9px;background:#0d1219;border-radius:4px;padding:6px 8px;color:#2d404f;border:0.5px solid rgba(255,255,255,0.07)">
           Risk per trade: <span style="color:var(--amber)" id="calcRisk">50.00</span> &nbsp;|&nbsp;
           Est. lots: <span style="color:var(--green)" id="calcLots">0.37</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="sect" id="tradeLogPanel">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.6rem">
+        <div class="sect-label" style="margin:0">MT5 Live Trades</div>
+        <div style="display:flex;align-items:center;gap:6px">
+          <div id="bridgeDot" style="width:6px;height:6px;border-radius:50%;background:#2d404f"></div>
+          <span id="bridgeStatus" style="font-family:var(--mono);font-size:9px;color:#2d404f">Bridge offline</span>
+        </div>
+      </div>
+      <div id="tradeList" style="display:flex;flex-direction:column;gap:4px;max-height:180px;overflow-y:auto">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--text3);padding:6px 0">
+          No trades yet — start mt5_bridge.py
         </div>
       </div>
     </div>
@@ -1188,7 +1348,10 @@ function handleResult(d){
   const active=allSignals.find(s=>s.pair===activePair);
   if(active) updateSignalUI(active);
   fetchChart(activePair);
-  addLog('Scan done — '+allSignals.length+' pairs | '+(d.server_time_utc||''),'SYS','info');
+  const freshCount = (d.refreshed||[]).length;
+  const cachedCount = (d.cached||[]).length;
+  addLog('Scan done — '+freshCount+' fresh, '+cachedCount+' cached | '+(d.server_time_utc||''),'SYS','info');
+  if(cachedCount>0) addLog('Cached pairs (price stable): '+(d.cached||[]).join(', '),'SYS','info');
 }
 
 // Pair select
@@ -1275,6 +1438,16 @@ function updateSignalUI(sig){
   const dir=sig.direction||'WAIT';
   document.getElementById('sigDir').textContent=dir;
   document.getElementById('sigDir').className='sig-dir '+dir;
+  const ct=document.getElementById('cacheTag');
+  if(ct){
+    if(sig.cached===true){
+      ct.textContent='CACHED'; ct.style.color='var(--blue)'; ct.style.borderColor='rgba(61,159,255,.3)'; ct.style.background='var(--blue-a)';
+    } else if(sig.cached===false){
+      ct.textContent='LIVE'; ct.style.color='var(--green)'; ct.style.borderColor='rgba(0,255,179,.3)'; ct.style.background='var(--green-a)';
+    } else {
+      ct.textContent='DEMO'; ct.style.color='var(--amber)'; ct.style.borderColor='rgba(255,184,0,.3)'; ct.style.background='var(--amber-a)';
+    }
+  }
   document.getElementById('scoreNum').textContent=sig.score_pct+'%';
   document.getElementById('scoreNum').className='score-num '+(dir==='BUY'?'bull':dir==='SELL'?'bear':'wait');
   const fill=document.getElementById('barFill');
@@ -1526,6 +1699,64 @@ async function fetchConfig(){
     const d=await r.json();
     loadConfig(d.config);
   } catch(e){ updCfg(); } // use defaults
+}
+
+// ── Trade log polling ─────────────────────────────────────────
+async function pollTrades(){
+  try{
+    const r=await fetch('/api/trades',{signal:AbortSignal.timeout(5000)});
+    const d=await r.json();
+    const trades=d.trades||[];
+    const tl=document.getElementById('tradeList');
+    const dot=document.getElementById('bridgeDot');
+    const bs=document.getElementById('bridgeStatus');
+
+    if(trades.length===0){
+      tl.innerHTML='<div style="font-family:var(--mono);font-size:10px;color:var(--text3);padding:6px 0">No trades yet — start mt5_bridge.py</div>';
+      return;
+    }
+
+    // Bridge is active if last trade within 5 min
+    const lastT=new Date(trades[trades.length-1].logged_at);
+    const age=(Date.now()-lastT)/1000;
+    if(age<300){
+      dot.style.background='var(--green)';
+      dot.style.animation='blink 1.2s infinite';
+      bs.textContent='Bridge active';
+      bs.style.color='var(--green)';
+    } else {
+      dot.style.background='var(--amber)';
+      bs.textContent='Bridge idle';
+      bs.style.color='var(--amber)';
+    }
+
+    tl.innerHTML=[...trades].reverse().slice(0,8).map(t=>{
+      const dir=t.direction==='BUY'?'dir-buy':'dir-sell';
+      const ts=new Date(t.logged_at);
+      const timeStr=ts.getUTCHours().toString().padStart(2,'0')+':'+ts.getUTCMinutes().toString().padStart(2,'0');
+      const statusColor=t.status==='filled'?'var(--green)':'var(--amber)';
+      return \`<div style="display:flex;align-items:center;gap:6px;padding:5px 8px;background:var(--bg2);border:0.5px solid rgba(255,255,255,0.06);border-radius:4px;font-family:var(--mono);font-size:10px">
+        <span style="color:var(--text3);min-width:34px">\${timeStr}</span>
+        <span class="\${dir}" style="min-width:28px;font-weight:700">\${t.direction}</span>
+        <span style="color:var(--text);min-width:52px">\${(t.pair||'').slice(0,3)+'/'+((t.pair||'').slice(3))}</span>
+        <span style="color:var(--text2)">\${t.lots}L</span>
+        <span style="flex:1;text-align:right;color:\${statusColor};font-size:9px">#\${t.ticket||'—'}</span>
+      </div>\`;
+    }).join('');
+  } catch(e){ /* bridge not running */ }
+}
+setInterval(pollTrades, 10000);  // poll every 10 seconds
+
+async function forceRescan(){
+  try{
+    const r=await fetch('/api/cache/clear',{method:'POST'});
+    const d=await r.json();
+    addLog('Cache cleared — '+d.message+'. Running fresh scan...','SYS','warn');
+    showToast('Cache cleared — fetching fresh signals','tw');
+  } catch(e){
+    addLog('Running local force rescan','SYS','warn');
+  }
+  await runScan();
 }
 
 // ══════════════════════════════════════════
