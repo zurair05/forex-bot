@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: smc-signal-dashboard
+    runtime: python
+    buildCommand: pip install flask flask-cors yfinance pandas numpy gunicorn
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 120 server:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0

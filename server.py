@@ -931,6 +931,9 @@ setInterval(loadPrices,60000);
 """
 
 def open_browser():
+    """Only opens browser when running locally, not on Render."""
+    if os.environ.get("RENDER"):
+        return  # skip on Render server
     time.sleep(1.2)
     webbrowser.open("http://localhost:5000")
 
@@ -947,4 +950,4 @@ if __name__ == "__main__":
     print(f"\n  Opening  : http://localhost:5000\n")
     t = threading.Thread(target=open_browser, daemon=True)
     t.start()
-    app.run(host="localhost", port=5000, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
