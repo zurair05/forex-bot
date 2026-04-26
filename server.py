@@ -247,7 +247,7 @@ def calc_adr(bars, days=14):
     pct = round(today_range / adr * 100) if adr > 0 else 0
     return round(adr, 5), round(today_range, 5), pct
 
-def grade_signal(score_pct, conf_count, in_killzone, adr_pct, rsi_div):
+def grade_signal(score_pct, conf_count, in_killzone, adr_pct):
     if score_pct > 85 and conf_count >= 4 and in_killzone and adr_pct < 70: return "A"
     if score_pct > 85 and conf_count >= 4: return "A"
     if score_pct > 75 and conf_count >= 3: return "B"
@@ -271,88 +271,7 @@ def is_trading_paused():
         return True, f"Daily loss limit hit ({_daily_drawdown_pips:.1f}p) — paused."
     return False, ""
 
-# ── Strategy 1: EMA 200 Macro Filter ──────────────────────────────────
-def calc_ema(bars, period=200):
-    """EMA using exponential smoothing. Returns current EMA value."""
-    if len(bars) < period:
-        # Not enough bars — use SMA as fallback
-        closes = [b["close"] for b in bars]
-        return sum(closes) / len(closes) if closes else 0
-    closes = [b["close"] for b in bars]
-    k = 2.0 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for c in closes[period:]:
-        ema = c * k + ema * (1 - k)
-    return round(ema, 6)
-
-
-# ── Strategy 2: RSI + Divergence ──────────────────────────────────────
-def calc_rsi(bars, period=14):
-    """Calculate RSI. Returns current RSI value (0-100)."""
-    if len(bars) < period + 1:
-        return 50.0
-    closes = [b["close"] for b in bars]
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    if len(gains) < period:
-        return 50.0
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 2)
-
-
-def detect_rsi_divergence(bars, period=14, lookback=20):
-    """
-    Detect RSI divergence:
-    - Bullish: price makes lower low but RSI makes higher low (hidden strength)
-    - Bearish: price makes higher high but RSI makes lower high (hidden weakness)
-    Returns: "bullish", "bearish", or None
-    """
-    if len(bars) < lookback + period + 5:
-        return None
-
-    # Calculate RSI for each bar in lookback window
-    rsi_vals = []
-    for i in range(len(bars) - lookback, len(bars)):
-        rsi_vals.append(calc_rsi(bars[:i+1], period))
-
-    prices  = [b["close"] for b in bars[-lookback:]]
-    highs   = [b["high"]  for b in bars[-lookback:]]
-    lows    = [b["low"]   for b in bars[-lookback:]]
-
-    # Find recent swing high and previous swing high
-    if len(prices) < 6 or len(rsi_vals) < 6:
-        return None
-
-    # Bearish divergence: price higher high, RSI lower high
-    curr_high_price = max(highs[-5:])
-    prev_high_price = max(highs[-lookback:-5])
-    curr_high_rsi   = max(rsi_vals[-5:])
-    prev_high_rsi   = max(rsi_vals[-lookback:-5])
-    if curr_high_price > prev_high_price and curr_high_rsi < prev_high_rsi - 2:
-        return "bearish"
-
-    # Bullish divergence: price lower low, RSI higher low
-    curr_low_price = min(lows[-5:])
-    prev_low_price = min(lows[-lookback:-5])
-    curr_low_rsi   = min(rsi_vals[-5:])
-    prev_low_rsi   = min(rsi_vals[-lookback:-5])
-    if curr_low_price < prev_low_price and curr_low_rsi > prev_low_rsi + 2:
-        return "bullish"
-
-    return None
-
-
-# ── Strategy 3: ICT Killzone Filter ────────────────────────────────────
+# ── ICT Killzone Filter ────────────────────────────────────────────────
 def get_killzone():
     """
     Returns current ICT killzone name or None.
@@ -483,193 +402,6 @@ def detect_judas_swing(bars, asian_range, pip=0.0001):
 
 
 # ── MACD ──────────────────────────────────────────────────────────────
-def calc_macd(bars, fast=12, slow=26, signal=9):
-    """MACD line, signal line, histogram. Returns (macd, signal, hist, divergence)"""
-    if len(bars) < slow + signal + 5:
-        return 0, 0, 0, None
-    closes = [b["close"] for b in bars]
-    def ema(data, period):
-        k = 2.0/(period+1); e = sum(data[:period])/period
-        for v in data[period:]: e = v*k + e*(1-k)
-        return e
-    # Calculate rolling MACD
-    macd_vals = []
-    for i in range(slow, len(closes)):
-        f = ema(closes[max(0,i-fast*3):i+1], fast)
-        s = ema(closes[max(0,i-slow*3):i+1], slow)
-        macd_vals.append(f - s)
-    if len(macd_vals) < signal + 5:
-        return 0, 0, 0, None
-    sig_line = ema(macd_vals, signal)
-    hist     = macd_vals[-1] - sig_line
-    macd_cur = macd_vals[-1]
-    # MACD divergence (last 10 bars)
-    div = None
-    if len(macd_vals) >= 10 and len(closes) >= slow + 10:
-        prices  = closes[-10:]
-        mvals   = macd_vals[-10:]
-        if min(prices) < min(prices[:-2]) and min(mvals) > min(mvals[:-2]):
-            div = "bullish"
-        elif max(prices) > max(prices[:-2]) and max(mvals) < max(mvals[:-2]):
-            div = "bearish"
-    return round(macd_cur,6), round(sig_line,6), round(hist,6), div
-
-
-# ── Bollinger Bands + Squeeze ──────────────────────────────────────────
-def calc_bollinger(bars, period=20, std_dev=2.0):
-    """Returns (upper, mid, lower, bandwidth, squeeze, %B)"""
-    if len(bars) < period:
-        return 0, 0, 0, 0, False, 0.5
-    closes = [b["close"] for b in bars[-period:]]
-    mid    = sum(closes) / period
-    variance = sum((c - mid)**2 for c in closes) / period
-    std    = variance**0.5
-    upper  = mid + std_dev * std
-    lower  = mid - std_dev * std
-    bw     = (upper - lower) / mid if mid > 0 else 0
-    # Squeeze: bandwidth in bottom 20% of recent range
-    recent_bws = []
-    for i in range(max(period, len(bars)-50), len(bars)-period+1):
-        c2 = [b["close"] for b in bars[i:i+period]]
-        m2 = sum(c2)/period
-        s2 = (sum((c-m2)**2 for c in c2)/period)**0.5
-        bw2 = (m2 + std_dev*s2 - (m2 - std_dev*s2)) / m2 if m2 > 0 else 0
-        recent_bws.append(bw2)
-    squeeze = bool(recent_bws and bw <= sorted(recent_bws)[int(len(recent_bws)*0.2)])
-    price   = bars[-1]["close"]
-    pct_b   = (price - lower) / (upper - lower) if (upper - lower) > 0 else 0.5
-    return round(upper,5), round(mid,5), round(lower,5), round(bw,4), squeeze, round(pct_b,3)
-
-
-# ── ATR (Average True Range) ───────────────────────────────────────────
-def calc_atr(bars, period=14):
-    """ATR = average of true ranges over period bars."""
-    if len(bars) < period + 1:
-        return 0
-    trs = []
-    for i in range(1, len(bars)):
-        hi, lo, prev_c = bars[i]["high"], bars[i]["low"], bars[i-1]["close"]
-        trs.append(max(hi-lo, abs(hi-prev_c), abs(lo-prev_c)))
-    if not trs: return 0
-    atr = sum(trs[:period]) / period
-    for tr in trs[period:]:
-        atr = (atr*(period-1) + tr) / period
-    return round(atr, 6)
-
-
-# ── Fibonacci Golden Pocket ────────────────────────────────────────────
-def calc_fib_levels(bars, lookback=50):
-    """
-    Find the last significant swing high/low in lookback bars.
-    Returns key Fibonacci levels (0.382, 0.5, 0.618, 0.705, 0.786)
-    and whether current price is in the Golden Pocket (0.618-0.786).
-    """
-    if len(bars) < lookback + 5:
-        return {}
-    recent = bars[-lookback:]
-    swing_hi = max(b["high"]  for b in recent)
-    swing_lo = min(b["low"]   for b in recent)
-    price    = bars[-1]["close"]
-    rng      = swing_hi - swing_lo
-    if rng == 0:
-        return {}
-    # Retracement levels from swing high (for bullish pullback)
-    levels = {
-        "0.236": round(swing_hi - rng*0.236, 5),
-        "0.382": round(swing_hi - rng*0.382, 5),
-        "0.500": round(swing_hi - rng*0.500, 5),
-        "0.618": round(swing_hi - rng*0.618, 5),
-        "0.705": round(swing_hi - rng*0.705, 5),
-        "0.786": round(swing_hi - rng*0.786, 5),
-    }
-    # Golden Pocket = 0.618 to 0.786 retracement
-    gp_hi = levels["0.618"]
-    gp_lo = levels["0.786"]
-    in_gp = gp_lo <= price <= gp_hi
-    # OTE zone (ICT) = 0.618 to 0.786
-    ote_zone = in_gp
-    return {
-        "levels": levels,
-        "swing_hi": round(swing_hi,5),
-        "swing_lo": round(swing_lo,5),
-        "in_golden_pocket": in_gp,
-        "ote_zone": ote_zone,
-        "gp_hi": gp_hi,
-        "gp_lo": gp_lo,
-    }
-
-
-# ── Candlestick Pattern Recognition ───────────────────────────────────
-def detect_candle_patterns(bars):
-    """
-    Detect high-probability reversal patterns on the last 3 bars.
-    Returns list of detected patterns with direction.
-    Win rates from backtests:
-      Engulfing: 70-75%, Pin Bar: 65-70%, Hammer: 65%, Morning/Evening Star: 70-75%
-    """
-    if len(bars) < 4:
-        return []
-    patterns = []
-    c  = bars[-1]  # current (most recent)
-    p1 = bars[-2]  # previous 1
-    p2 = bars[-3]  # previous 2
-
-    def body(b):  return abs(b["close"] - b["open"])
-    def rng(b):   return b["high"] - b["low"]
-    def bull(b):  return b["close"] > b["open"]
-    def bear(b):  return b["close"] < b["open"]
-    def wick_lo(b): return min(b["open"],b["close"]) - b["low"]
-    def wick_hi(b): return b["high"] - max(b["open"],b["close"])
-
-    # ── Bullish Engulfing ─────────────────────────────────────────────
-    if (bear(p1) and bull(c) and
-        c["open"] <= p1["close"] and c["close"] >= p1["open"] and
-        body(c) > body(p1)):
-        patterns.append({"pattern":"Bull Engulfing","dir":"bullish","weight":0.12})
-
-    # ── Bearish Engulfing ─────────────────────────────────────────────
-    if (bull(p1) and bear(c) and
-        c["open"] >= p1["close"] and c["close"] <= p1["open"] and
-        body(c) > body(p1)):
-        patterns.append({"pattern":"Bear Engulfing","dir":"bearish","weight":0.12})
-
-    # ── Bullish Pin Bar (Hammer) ──────────────────────────────────────
-    if (wick_lo(c) >= body(c)*2.5 and wick_hi(c) < body(c)*0.5 and
-        body(c) < rng(c)*0.35):
-        patterns.append({"pattern":"Bull Pin Bar","dir":"bullish","weight":0.10})
-
-    # ── Bearish Pin Bar (Shooting Star) ──────────────────────────────
-    if (wick_hi(c) >= body(c)*2.5 and wick_lo(c) < body(c)*0.5 and
-        body(c) < rng(c)*0.35):
-        patterns.append({"pattern":"Bear Pin Bar","dir":"bearish","weight":0.10})
-
-    # ── Doji (indecision → watch for next bar direction) ─────────────
-    if body(c) < rng(c)*0.1 and rng(c) > 0:
-        patterns.append({"pattern":"Doji","dir":"neutral","weight":0.05})
-
-    # ── Morning Star (3-bar bullish reversal) ─────────────────────────
-    if (bear(p2) and body(p1) < body(p2)*0.5 and bull(c) and
-        c["close"] > (p2["open"]+p2["close"])/2):
-        patterns.append({"pattern":"Morning Star","dir":"bullish","weight":0.13})
-
-    # ── Evening Star (3-bar bearish reversal) ─────────────────────────
-    if (bull(p2) and body(p1) < body(p2)*0.5 and bear(c) and
-        c["close"] < (p2["open"]+p2["close"])/2):
-        patterns.append({"pattern":"Evening Star","dir":"bearish","weight":0.13})
-
-    # ── Bullish Outside Bar ───────────────────────────────────────────
-    if (bull(c) and c["high"] > p1["high"] and c["low"] < p1["low"] and
-        body(c) > body(p1)*1.5):
-        patterns.append({"pattern":"Bull Outside","dir":"bullish","weight":0.08})
-
-    # ── Bearish Outside Bar ───────────────────────────────────────────
-    if (bear(c) and c["high"] > p1["high"] and c["low"] < p1["low"] and
-        body(c) > body(p1)*1.5):
-        patterns.append({"pattern":"Bear Outside","dir":"bearish","weight":0.08})
-
-    return patterns
-
-
 def analyse(bars, pair):
     if not bars or len(bars)<50: return {}
     p=PIP.get(pair,0.0001); rev=list(reversed(bars)); price=rev[0]["close"]
@@ -684,27 +416,11 @@ def analyse(bars, pair):
     near_fvgs=[f for f in fvgs if abs(f["mid"]-price)/p<100]
     liq=[{"price":s["price"],"type":"BSL" if s["hi"] else "SSL"} for s in sw[-12:]]
 
-    # Strategy indicators
-    ema200      = calc_ema(bars, 200)
-    ema50       = calc_ema(bars, 50)
-    rsi         = calc_rsi(bars, 14)
-    rsi_div     = detect_rsi_divergence(bars, 14)
+    # ICT: breakers, Asian range, Judas swing, killzone
     breakers    = detect_breakers(rev, p)
     asian_range = get_asian_range(bars)
     judas       = detect_judas_swing(rev, asian_range, p)
     kz          = get_killzone()
-
-    # New indicators
-    macd_line, macd_sig, macd_hist, macd_div = calc_macd(bars)
-    bb_up, bb_mid, bb_lo, bb_bw, bb_squeeze, pct_b = calc_bollinger(bars)
-    atr         = calc_atr(bars)
-    fib         = calc_fib_levels(bars)
-    candles     = detect_candle_patterns(rev)  # rev so most recent is bars[-1] perspective
-
-    # EMA bias
-    above_ema200 = price > ema200 if ema200 > 0 else None
-    above_ema50  = price > ema50  if ema50  > 0 else None
-    ema_trend    = "bullish" if above_ema200 else "bearish" if above_ema200 is False else "unknown"
 
     # Asian range position
     near_asian_hi = asian_range and abs(price - asian_range["hi"]) / p < 20
@@ -712,46 +428,11 @@ def analyse(bars, pair):
     above_asian   = asian_range and price > asian_range["hi"]
     below_asian   = asian_range and price < asian_range["lo"]
 
-    # Bollinger position
-    near_bb_lo  = pct_b < 0.1   # near lower band (oversold)
-    near_bb_hi  = pct_b > 0.9   # near upper band (overbought)
-    inside_bb   = 0.1 <= pct_b <= 0.9
-
-    # ATR-based dynamic SL suggestion
-    atr_sl_pips = round(atr * 1.5 / p) if p > 0 and atr > 0 else 30
-    atr_sl_pips = max(15, min(atr_sl_pips, 80))  # clamp 15-80 pips
-
     return {"price":price,"trend":trend,"mid":mid,
             "disc":price<mid,"prem":price>mid,
             "choch":choch,"cd":cd,"bos":bos,"bd":bd,
             "obs":obs,"tapped":[o for o in obs if o["tapped"]],
             "fvgs":fvgs,"near":near_fvgs,"liq":liq,
-            # EMA
-            "ema200":round(ema200,5),"ema50":round(ema50,5),
-            "ema_trend":ema_trend,
-            "above_ema200":above_ema200,"above_ema50":above_ema50,
-            # RSI
-            "rsi":rsi,"rsi_div":rsi_div,
-            # MACD
-            "macd":macd_line,"macd_sig":macd_sig,
-            "macd_hist":macd_hist,"macd_div":macd_div,
-            "macd_bull": macd_hist > 0 and macd_line > macd_sig,
-            "macd_bear": macd_hist < 0 and macd_line < macd_sig,
-            # Bollinger
-            "bb_up":bb_up,"bb_mid":bb_mid,"bb_lo":bb_lo,
-            "bb_bw":bb_bw,"bb_squeeze":bb_squeeze,"pct_b":pct_b,
-            "near_bb_lo":near_bb_lo,"near_bb_hi":near_bb_hi,
-            # ATR
-            "atr":round(atr,6),"atr_pips":round(atr/p) if p>0 else 0,
-            "atr_sl_pips":atr_sl_pips,
-            # Fibonacci
-            "fib":fib,
-            "in_golden_pocket":fib.get("in_golden_pocket",False),
-            "ote_zone":fib.get("ote_zone",False),
-            # Candlestick patterns
-            "candles":candles,
-            "bull_candle":any(c["dir"]=="bullish" for c in candles),
-            "bear_candle":any(c["dir"]=="bearish" for c in candles),
             # Session / ICT
             "breakers":breakers,
             "asian_range":asian_range,
@@ -763,13 +444,15 @@ def analyse(bars, pair):
 
 def score(buy, htf, mtf, ltf):
     """
-    Multi-strategy confluence scorer.
-    Original SMC factors + 6 new strategies layered on top.
-    Each factor adds weight — signal only fires if total > 70%.
+    SMC + ICT confluence scorer.
+    Pure Smart Money Concepts (HTF trend, OB, FVG, CHoCH, BOS, Liquidity,
+    Premium/Discount) layered with the four ICT concepts that go with it
+    (Killzones, Asian range, Judas swing, Breaker blocks).
+    Signal only fires if total > 70%.
     """
     s=0.0; c=[]
 
-    # ── Original SMC (max ~1.15 raw) ─────────────────────────────────
+    # ── Classic SMC ───────────────────────────────────────────────────
     if buy  and htf.get("trend")=="bullish": s+=0.20;c.append("HTF↑")
     if not buy and htf.get("trend")=="bearish": s+=0.20;c.append("HTF↓")
     if any(o["bull"]==buy for o in mtf.get("tapped",[])): s+=0.20;c.append("OB_tap")
@@ -782,104 +465,27 @@ def score(buy, htf, mtf, ltf):
     if not buy and mtf.get("prem"):  s+=0.10;c.append("Premium")
     if ltf.get("choch") and ltf["cd"]==("bullish" if buy else "bearish"): s+=0.10;c.append("LTF↑" if buy else "LTF↓")
 
-    # ── Strategy 1: EMA 200 Macro Filter (+0.15 bonus, -0.10 penalty) ─
-    # Price above EMA200 = institutions are long, only take buys at discount
-    # Price below EMA200 = institutions are short, only take sells at premium
-    if mtf.get("above_ema200") is True:
-        if buy:  s+=0.15;c.append("EMA200↑")
-        else:    s-=0.10;c.append("vs_EMA200")   # fighting macro trend
-    elif mtf.get("above_ema200") is False:
-        if not buy: s+=0.15;c.append("EMA200↓")
-        else:       s-=0.10;c.append("vs_EMA200")
-
-    # EMA50 trend alignment bonus
-    if mtf.get("above_ema50") is True and buy:  s+=0.05;c.append("EMA50↑")
-    elif mtf.get("above_ema50") is False and not buy: s+=0.05;c.append("EMA50↓")
-
-    # ── Strategy 2: RSI Filter (+0.10) ────────────────────────────────
-    # RSI in optimal zone: buy from oversold bounce (30-50), sell from overbought fall (50-70)
-    rsi = mtf.get("rsi", 50)
-    if buy  and 25 <= rsi <= 55: s+=0.10;c.append(f"RSI_buy({rsi:.0f})")
-    if not buy and 45 <= rsi <= 75: s+=0.10;c.append(f"RSI_sell({rsi:.0f})")
-    # Extreme RSI adds extra weight (oversold/overbought)
-    if buy  and rsi < 30: s+=0.05;c.append("RSI_OS")
-    if not buy and rsi > 70: s+=0.05;c.append("RSI_OB")
-
-    # ── Strategy 3: RSI Divergence (+0.15) ────────────────────────────
-    rsi_div = mtf.get("rsi_div")
-    if buy  and rsi_div == "bullish": s+=0.15;c.append("RSI_Div↑")
-    if not buy and rsi_div == "bearish": s+=0.15;c.append("RSI_Div↓")
-    # Cross-timeframe divergence
-    ltf_div = ltf.get("rsi_div")
-    if buy  and ltf_div == "bullish": s+=0.08;c.append("LTF_RSI_Div↑")
-    if not buy and ltf_div == "bearish": s+=0.08;c.append("LTF_RSI_Div↓")
-
-    # ── Strategy 4: ICT Killzone (+0.12) ──────────────────────────────
-    # Signals inside London or NY killzone get a significant bonus
+    # ── ICT Killzone ──────────────────────────────────────────────────
     kz = mtf.get("killzone")
     if kz == "London":   s+=0.12;c.append("London_KZ")
     elif kz == "New York": s+=0.10;c.append("NY_KZ")
-    # Outside killzone = slight penalty (lower probability window)
-    elif kz is None:     s-=0.05  # no label, silent penalty
+    elif kz is None:     s-=0.05  # outside killzone — silent penalty
 
-    # ── Strategy 5: Asian Range (+0.10) ───────────────────────────────
-    # Price at Asian range extremes = high probability reversal zone
+    # ── Asian Range ───────────────────────────────────────────────────
     if buy  and mtf.get("near_asian_lo"):  s+=0.10;c.append("Asian_Lo")
     if not buy and mtf.get("near_asian_hi"): s+=0.10;c.append("Asian_Hi")
-    # Price broke Asian range = continuation momentum
     if buy  and mtf.get("above_asian"):    s+=0.08;c.append("Asian_Break↑")
     if not buy and mtf.get("below_asian"):  s+=0.08;c.append("Asian_Break↓")
 
-    # ── Strategy 6: Judas Swing (+0.15) ───────────────────────────────
-    # London open manipulation sweep then reversal = highest probability setup
+    # ── Judas Swing (London open sweep + reversal) ───────────────────
     judas = mtf.get("judas")
     if buy  and judas == "bull_reversal": s+=0.15;c.append("Judas_Sweep↑")
     if not buy and judas == "bear_reversal": s+=0.15;c.append("Judas_Sweep↓")
 
-    # ── Strategy 7: Breaker Blocks (+0.12) ───────────────────────────
+    # ── Breaker Blocks ────────────────────────────────────────────────
     breakers = mtf.get("breakers", [])
     if buy  and any(b["bull"] for b in breakers): s+=0.12;c.append("Breaker↑")
     if not buy and any(not b["bull"] for b in breakers): s+=0.12;c.append("Breaker↓")
-
-    # ── Strategy 8: MACD Confirmation (+0.10) ─────────────────────────
-    # MACD above zero + histogram growing = strong momentum confirmation
-    if buy  and mtf.get("macd_bull"):  s+=0.10;c.append("MACD↑")
-    if not buy and mtf.get("macd_bear"): s+=0.10;c.append("MACD↓")
-    # MACD divergence adds extra weight
-    if buy  and mtf.get("macd_div")=="bullish": s+=0.08;c.append("MACD_Div↑")
-    if not buy and mtf.get("macd_div")=="bearish": s+=0.08;c.append("MACD_Div↓")
-
-    # ── Strategy 9: Bollinger Bands (+0.08) ───────────────────────────
-    # Squeeze + breakout direction = high probability expansion
-    if mtf.get("bb_squeeze"): s+=0.06;c.append("BB_Squeeze")
-    if buy  and mtf.get("near_bb_lo"): s+=0.08;c.append("BB_OversoldBounce")
-    if not buy and mtf.get("near_bb_hi"): s+=0.08;c.append("BB_OverboughtDrop")
-    # Price crossing back inside after breakout = mean reversion
-    if buy  and mtf.get("pct_b",0.5) > 0.5 and mtf.get("bb_squeeze"): s+=0.05;c.append("BB_BreakUp")
-    if not buy and mtf.get("pct_b",0.5) < 0.5 and mtf.get("bb_squeeze"): s+=0.05;c.append("BB_BreakDn")
-
-    # ── Strategy 10: Fibonacci Golden Pocket (+0.15) ──────────────────
-    # Price in 0.618–0.786 retracement zone = OTE, institutions enter here
-    if mtf.get("in_golden_pocket"):
-        s+=0.15;c.append("Fib_GP")   # both directions benefit from this zone
-    if mtf.get("ote_zone") and buy:  s+=0.05;c.append("OTE_Zone↑")
-    if mtf.get("ote_zone") and not buy: s+=0.05;c.append("OTE_Zone↓")
-
-    # ── Strategy 11: Candlestick Pattern Confirmation (+0.08–0.13) ────
-    # Reversal candle at key level = institutional footprint visible on chart
-    candles = mtf.get("candles", [])
-    for cp in candles:
-        if buy  and cp["dir"]=="bullish":
-            s += cp["weight"]; c.append(cp["pattern"]+"↑")
-        if not buy and cp["dir"]=="bearish":
-            s += cp["weight"]; c.append(cp["pattern"]+"↓")
-        if cp["dir"]=="neutral" and cp["pattern"]=="Doji":
-            s += 0.03  # Doji adds slight uncertainty bonus (confirms indecision at key level)
-
-    # ── Strategy 12: ATR Volatility Filter ────────────────────────────
-    atr_pips = mtf.get("atr_pips", 30)
-    if 10 <= atr_pips <= 25:  s+=0.05;c.append(f"ATR_coil({atr_pips}p)")
-    elif atr_pips > 60:       s-=0.05
 
     return round(min(s,1.0),3),c
 
@@ -903,6 +509,80 @@ def get_correlated_active(pair: str, trade_state: dict) -> list:
         if key in CORRELATIONS:
             correlated.append((ap, CORRELATIONS[key]))
     return correlated
+
+def calc_limit_entry(direction, price, mtf, p, sl_pips):
+    """
+    Compute a realistic *limit-order* entry — NOT the current market price.
+    Real SMC signals wait for price to pull back to a key technical level
+    (Order Block, FVG, or Breaker) before entering.
+
+    BUY  → entry below current price (a discount level)
+    SELL → entry above current price (a premium level)
+    """
+    if direction not in ("BUY", "SELL"):
+        return price  # WAIT — caller will not use this anyway
+
+    candidates = []
+
+    if direction == "BUY":
+        # Order Block top / mid — price often retests bullish OB before continuing up
+        for ob in mtf.get("obs", []) or []:
+            top = ob.get("hi"); mid = ob.get("mid")
+            if ob.get("bull") and top and top < price:
+                candidates.append(top)
+            if ob.get("bull") and mid and mid < price:
+                candidates.append(mid)
+        # FVG midpoint — fair value gaps tend to fill
+        for fvg in mtf.get("fvgs", []) or []:
+            m = fvg.get("mid")
+            if fvg.get("bull") and m and m < price:
+                candidates.append(m)
+        # Breaker block top — flipped support, retest entry
+        for bk in mtf.get("breakers", []) or []:
+            top = bk.get("hi")
+            if bk.get("bull") and top and top < price:
+                candidates.append(top)
+        # Asian range low — institutional pullback level
+        ar = mtf.get("asian_range")
+        if ar and ar.get("lo") and ar["lo"] < price:
+            candidates.append(ar["lo"])
+    else:  # SELL
+        for ob in mtf.get("obs", []) or []:
+            bot = ob.get("lo"); mid = ob.get("mid")
+            if (ob.get("bull") is False) and bot and bot > price:
+                candidates.append(bot)
+            if (ob.get("bull") is False) and mid and mid > price:
+                candidates.append(mid)
+        for fvg in mtf.get("fvgs", []) or []:
+            m = fvg.get("mid")
+            if (fvg.get("bull") is False) and m and m > price:
+                candidates.append(m)
+        for bk in mtf.get("breakers", []) or []:
+            bot = bk.get("lo")
+            if (bk.get("bull") is False) and bot and bot > price:
+                candidates.append(bot)
+        ar = mtf.get("asian_range")
+        if ar and ar.get("hi") and ar["hi"] > price:
+            candidates.append(ar["hi"])
+
+    # Filter to a sensible distance window: at least ~25% of SL away,
+    # at most ~120% of SL (otherwise the entry is unreachable).
+    min_d = max(p * 5, p * sl_pips * 0.25)
+    max_d = p * sl_pips * 1.2
+    valid = []
+    for c in candidates:
+        d = (price - c) if direction == "BUY" else (c - price)
+        if min_d <= d <= max_d:
+            valid.append(c)
+
+    if valid:
+        # Closest to current price = highest fill probability
+        return max(valid) if direction == "BUY" else min(valid)
+
+    # Fallback — half-SL pullback (so the signal is still a limit, not market)
+    offset = p * sl_pips * 0.5
+    return price - offset if direction == "BUY" else price + offset
+
 
 def make_signal(pair, htf, mtf, ltf, bars=None):
     p=PIP.get(pair,0.0001); dp=DIGITS.get(pair,5); price=mtf.get("price",0)
@@ -949,15 +629,33 @@ def make_signal(pair, htf, mtf, ltf, bars=None):
         if sc_val <= 0.70:
             direction = "WAIT"
             log.info(f"  {pair}: dropped to WAIT after correlation penalty")
-    # Use ATR-based SL when available, fallback to 30 pips fixed
-    atr_sl_pips = mtf.get("atr_sl_pips", 30)
-    sl_pips     = max(20, min(atr_sl_pips, 60))  # 20-60 pip range
-    sl_d        = p * sl_pips
-    entry = round(price, dp)
-    sl  = round(price - sl_d if direction=="BUY" else price + sl_d, dp)
-    tp1 = round(price + sl_d*1.5 if direction=="BUY" else price - sl_d*1.5, dp)
-    tp2 = round(price + sl_d*3.0 if direction=="BUY" else price - sl_d*3.0, dp)
+    # Fixed 30-pip SL (classic SMC default — no ATR auto-sizing)
+    sl_pips = 30
+    sl_d    = p * sl_pips
+
+    # ── Realistic limit entry (NOT current market price) ─────────────────
+    # Previously: entry = round(price, dp), which meant every signal "started"
+    # at the live scan-time price. Now we compute a pullback level from SMC
+    # confluence (OB / FVG / Breaker / Asian range). The signal waits in
+    # "pending" status until price actually trades to that level.
+    if direction in ("BUY", "SELL"):
+        raw_entry = calc_limit_entry(direction, price, mtf, p, sl_pips)
+    else:
+        raw_entry = price  # WAIT signal — entry not used
+
+    entry = round(raw_entry, dp)
+    sl  = round(entry - sl_d if direction=="BUY" else entry + sl_d, dp)
+    tp1 = round(entry + sl_d*1.5 if direction=="BUY" else entry - sl_d*1.5, dp)
+    tp2 = round(entry + sl_d*3.0 if direction=="BUY" else entry - sl_d*3.0, dp)
     rr  = round(abs(tp1-entry)/abs(entry-sl), 2) if abs(entry-sl) > 0 else 0
+
+    # Distance from current price → entry (in pips). 0 = market fill, >0 = waiting
+    if direction in ("BUY", "SELL") and p > 0:
+        entry_distance_pips = round(abs(price - entry) / p, 1)
+    else:
+        entry_distance_pips = 0
+    entry_type = "limit" if entry_distance_pips >= 1 else "market"
+
     zones=[]
     for ob in mtf.get("obs",[])[-3:]:
         zones.append({"type":"Bull OB" if ob["bull"] else "Bear OB",
@@ -978,31 +676,17 @@ def make_signal(pair, htf, mtf, ltf, bars=None):
     if ar:
         zones.append({"type":"Asian Hi","price":round(ar["hi"],dp),"status":"Session Level","color":"blue"})
         zones.append({"type":"Asian Lo","price":round(ar["lo"],dp),"status":"Session Level","color":"blue"})
-    # Fibonacci Golden Pocket
-    fib = mtf.get("fib",{})
-    if fib.get("in_golden_pocket"):
-        zones.append({"type":"Fib Golden Pocket","hi":round(fib["gp_hi"],dp),
-                      "lo":round(fib["gp_lo"],dp),"status":"OTE Zone","color":"amber"})
-    # Bollinger Bands
-    if mtf.get("bb_up"):
-        zones.append({"type":"BB Upper","price":round(mtf["bb_up"],dp),"status":"Resistance","color":"red"})
-        zones.append({"type":"BB Lower","price":round(mtf["bb_lo"],dp),"status":"Support","color":"green"})
-    # Store BB mid and EMA values directly in signal for chart rendering
-    bb_mid_val = mtf.get("bb_mid", 0)
-    bb_lo_val  = mtf.get("bb_lo", 0)
-    bb_up_val  = mtf.get("bb_up", 0)
+
     now_ts = datetime.now(timezone.utc).isoformat()
     kz = mtf.get("killzone")
-    # Full confluence breakdown for UI chart
+    # Confluence breakdown for UI chart — SMC + ICT only
     bull_breakdown = {
         "HTF Trend":     0.20 if htf.get("trend")=="bullish" else 0,
-        "EMA 200":       0.15 if mtf.get("above_ema200") else 0,
         "Order Block":   0.20 if any(o["bull"] for o in mtf.get("tapped",[])) else 0,
         "FVG":           0.15 if any(f["bull"] for f in mtf.get("near",[])) else 0,
         "CHoCH":         0.20 if (mtf.get("choch") and mtf.get("cd")=="bullish") else 0,
         "BOS":           0.10 if (mtf.get("bos") and mtf.get("bd")=="bullish") else 0,
         "Liq Sweep":     0.10 if any(l["type"]=="SSL" for l in mtf.get("liq",[])) else 0,
-        "RSI Divergence":0.15 if mtf.get("rsi_div")=="bullish" else 0,
         "Killzone":      0.12 if kz in ("London","New York") else 0,
         "Asian Range":   0.10 if mtf.get("near_asian_lo") else 0,
         "Judas Swing":   0.15 if mtf.get("judas")=="bull_reversal" else 0,
@@ -1011,13 +695,11 @@ def make_signal(pair, htf, mtf, ltf, bars=None):
     }
     bear_breakdown = {
         "HTF Trend":     0.20 if htf.get("trend")=="bearish" else 0,
-        "EMA 200":       0.15 if not mtf.get("above_ema200",True) else 0,
         "Order Block":   0.20 if any(not o["bull"] for o in mtf.get("tapped",[])) else 0,
         "FVG":           0.15 if any(not f["bull"] for f in mtf.get("near",[])) else 0,
         "CHoCH":         0.20 if (mtf.get("choch") and mtf.get("cd")=="bearish") else 0,
         "BOS":           0.10 if (mtf.get("bos") and mtf.get("bd")=="bearish") else 0,
         "Liq Sweep":     0.10 if any(l["type"]=="BSL" for l in mtf.get("liq",[])) else 0,
-        "RSI Divergence":0.15 if mtf.get("rsi_div")=="bearish" else 0,
         "Killzone":      0.12 if kz in ("London","New York") else 0,
         "Asian Range":   0.10 if mtf.get("near_asian_hi") else 0,
         "Judas Swing":   0.15 if mtf.get("judas")=="bear_reversal" else 0,
@@ -1028,7 +710,10 @@ def make_signal(pair, htf, mtf, ltf, bars=None):
     return {"pair":pair,"direction":direction,"score":sc_val,
             "score_pct":round(sc_val*100),"conf":conf,
             "entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"rr":rr,
-            "sl_pips":30,"tp1_pips":45,"tp2_pips":90,
+            "current_price": round(price, dp),
+            "entry_type": entry_type,
+            "entry_distance_pips": entry_distance_pips,
+            "sl_pips":sl_pips,"tp1_pips":int(sl_pips*1.5),"tp2_pips":int(sl_pips*3.0),
             "trend":mtf.get("trend","ranging"),
             "htf_trend":htf.get("trend","ranging"),
             "mtf_trend":mtf.get("trend","ranging"),
@@ -1042,34 +727,16 @@ def make_signal(pair, htf, mtf, ltf, bars=None):
             "conf_breakdown":active_breakdown,
             "ob_count":mtf.get("ob_count",0),
             "fvg_count":mtf.get("fvg_count",0),
-            # New strategy fields
-            "ema200":mtf.get("ema200",0),
-            "ema50":mtf.get("ema50",0),
-            "ema_trend":mtf.get("ema_trend","unknown"),
-            "rsi":mtf.get("rsi",50),
-            "rsi_div":mtf.get("rsi_div"),
+            # SMC + ICT context fields
             "killzone":mtf.get("killzone"),
             "asian_range":mtf.get("asian_range"),
             "judas":mtf.get("judas"),
             "breaker_count":len(mtf.get("breakers",[])),
-            # New indicator fields
-            "macd":mtf.get("macd",0),
-            "macd_hist":mtf.get("macd_hist",0),
-            "macd_div":mtf.get("macd_div"),
-            "bb_squeeze":mtf.get("bb_squeeze",False),
-            "pct_b":mtf.get("pct_b",0.5),
-            "atr_pips":mtf.get("atr_pips",0),
-            "sl_pips":sl_pips,
-            "in_golden_pocket":mtf.get("in_golden_pocket",False),
-            "candle_patterns":[cp["pattern"] for cp in mtf.get("candles",[])],
-            "bb_mid": mtf.get("bb_mid",0),
-            "bb_lo":  mtf.get("bb_lo",0),
-            "bb_up":  mtf.get("bb_up",0),
             # Quality metrics
             "grade": grade_signal(
                 round(sc_val*100), len(real_conf),
                 mtf.get("killzone") in ("London","New York"),
-                adr_pct, mtf.get("rsi_div")
+                adr_pct
             ),
             "conf_count": len(real_conf),
             "adr_pips": adr_pips,
@@ -1083,14 +750,18 @@ def make_signal(pair, htf, mtf, ltf, bars=None):
 
 def check_trade_outcomes(prices: dict):
     """
-    For every active signal, check if current price has hit TP1, TP2 or SL.
-    If hit → mark as complete and clear from signal cache so a NEW signal
-    can be generated on the next scan.
+    Drive the signal lifecycle on each tick.
+
+    pending → active : when price reaches the limit entry
+    pending → cancel : if price has moved past SL before ever filling
+                       (the setup is invalidated; no PnL recorded)
+    active  → tp/sl  : existing TP1 / TP2 / SL outcome logic
     """
     global _trade_state, _signal_cache, _signal_history
 
     for pair, state in list(_trade_state.items()):
-        if state.get("status") != "active":
+        status = state.get("status")
+        if status not in ("pending", "active", "tp1_hit"):
             continue
 
         cur = prices.get(pair, {}).get("price", 0)
@@ -1102,6 +773,29 @@ def check_trade_outcomes(prices: dict):
         sl        = state["sl"]
         tp1       = state["tp1"]
         tp2       = state["tp2"]
+
+        # ── PENDING: waiting for price to reach the limit entry ──────────
+        if status == "pending":
+            # Invalidate if SL is breached before fill (setup is wrong)
+            invalidated = (direction == "BUY"  and cur <= sl) or \
+                          (direction == "SELL" and cur >= sl)
+            if invalidated:
+                log.info(f"  {pair}: PENDING signal CANCELLED — price hit SL before filling")
+                _trade_state.pop(pair, None)
+                _signal_cache.pop(pair, None)
+                continue
+            # Fill if price reaches entry
+            filled = (direction == "BUY"  and cur <= entry) or \
+                     (direction == "SELL" and cur >= entry)
+            if filled:
+                state["status"]    = "active"
+                state["filled_at"] = datetime.now(timezone.utc).isoformat()
+                log.info(f"  {pair}: Limit FILLED @ {entry} — now ACTIVE "
+                         f"(SL={sl} TP1={tp1} TP2={tp2})")
+            else:
+                # still pending, nothing else to do
+                continue
+
         outcome   = None
         hit_price = cur
 
@@ -1192,13 +886,22 @@ def check_trade_outcomes(prices: dict):
 
 
 def activate_signal(sig: dict):
-    """Register a new signal as active in trade state tracker."""
+    """
+    Register a new signal in the trade state tracker.
+
+    A signal is born "pending" — meaning the user / market hasn't yet pulled
+    back to the limit entry. It only becomes "active" once price actually
+    trades to the entry level. SL/TP outcomes are evaluated only while
+    active so a signal cannot hit TP/SL before it fills.
+    """
     global _trade_state
     pair = sig["pair"]
     if sig["direction"] == "WAIT":
         return
     # Only register if not already tracking this pair
-    if pair not in _trade_state or _trade_state[pair].get("status") not in ("active","tp1_hit"):
+    if pair not in _trade_state or _trade_state[pair].get("status") not in ("pending","active","tp1_hit"):
+        # If the entry is essentially the current price, treat as immediate fill
+        initial_status = "pending" if sig.get("entry_type") == "limit" else "active"
         _trade_state[pair] = {
             "pair":      pair,
             "direction": sig["direction"],
@@ -1208,12 +911,17 @@ def activate_signal(sig: dict):
             "tp2":       sig["tp2"],
             "score_pct": sig["score_pct"],
             "conf":      sig["conf"],
-            "status":    "active",
+            "status":    initial_status,
             "opened_at": datetime.now(timezone.utc).isoformat(),
+            "filled_at": None if initial_status == "pending" else datetime.now(timezone.utc).isoformat(),
             "hit_price": None,
             "hit_at":    None,
         }
-        log.info(f"  {pair}: Signal ACTIVATED — watching SL={sig['sl']} TP1={sig['tp1']} TP2={sig['tp2']}")
+        if initial_status == "pending":
+            log.info(f"  {pair}: Signal PENDING — limit @ {sig['entry']} "
+                     f"(distance {sig.get('entry_distance_pips',0)}p), waiting to fill")
+        else:
+            log.info(f"  {pair}: Signal ACTIVATED — watching SL={sig['sl']} TP1={sig['tp1']} TP2={sig['tp2']}")
 
 
 def run_scan(force=False):
@@ -1225,26 +933,57 @@ def run_scan(force=False):
     # If hit → clears cache so a fresh signal can be generated below
     check_trade_outcomes(prices)
 
+    now = datetime.now(timezone.utc)
     for pair in PAIRS:
         cur_price = prices.get(pair, {}).get("price", 0)
         state     = _trade_state.get(pair, {})
+        cached    = _signal_cache.get(pair)
 
-        # Step 2: If signal is still active (between entry and TP2/SL), keep showing it
-        if state.get("status") in ("active", "tp1_hit") and not force:
-            if pair in _signal_cache:
-                sig = dict(_signal_cache[pair])
+        # ── Compute cached-signal age (seconds) ─────────────────────────
+        cache_age = float("inf")
+        if cached and cached.get("generated_at"):
+            try:
+                gen_at = datetime.fromisoformat(cached["generated_at"])
+                cache_age = (now - gen_at).total_seconds()
+            except Exception:
+                cache_age = float("inf")
+
+        # ── HOLD conditions (do NOT regenerate the signal) ──────────────
+        # 1. Trade is pending fill, active, or partially closed (tp1_hit)
+        #    → must let it run until check_trade_outcomes closes it.
+        # 2. Signal is younger than SIGNAL_TTL (15 min by default)
+        #    → prevents auto-scan from churning a signal every 5 min just
+        #    because the live market price drifted. The signal completes
+        #    (TP/SL/cancel) before a new one can replace it.
+        in_trade  = state.get("status") in ("pending", "active", "tp1_hit")
+        ttl_alive = cached is not None and cache_age < SIGNAL_TTL
+
+        if (in_trade or ttl_alive) and not force:
+            if cached:
+                sig = dict(cached)
                 sig["cached"]        = True
-                sig["trade_status"]  = state["status"]
-                # Update live P&L pips
-                if cur_price and sig.get("entry"):
-                    p = PIP.get(pair, 0.0001)
+                sig["trade_status"]  = state.get("status") or sig.get("direction","WAIT").lower()
+                p = PIP.get(pair, 0.0001)
+                # Always refresh current price + entry distance
+                if cur_price:
+                    sig["current_price"] = round(cur_price, DIGITS.get(pair, 5))
+                    if sig.get("entry") and p > 0:
+                        sig["entry_distance_pips"] = round(
+                            abs(cur_price - sig["entry"]) / p, 1)
+                # Live P&L pips only meaningful after fill
+                if state.get("status") in ("active", "tp1_hit") and cur_price and sig.get("entry"):
                     pnl = (cur_price - sig["entry"]) / p if sig["direction"] == "BUY"                           else (sig["entry"] - cur_price) / p
                     sig["live_pnl_pips"] = round(pnl, 1)
+                else:
+                    sig["live_pnl_pips"] = 0
+                # Refresh visible age so UI can show "X min ago"
+                sig["signal_age_min"] = round(cache_age / 60, 1)
                 out.append(sig)
-                log.info(f"  {pair}: IN TRADE ({state['status']}) — holding signal")
+                why = "in-trade" if in_trade else f"ttl({int(SIGNAL_TTL-cache_age)}s left)"
+                log.info(f"  {pair}: HOLDING signal ({why})")
                 continue
 
-        # Step 3: Generate fresh signal (TP/SL hit OR first scan OR forced)
+        # Step 3: Generate fresh signal (TP/SL hit OR TTL expired OR first scan OR forced)
         try:
             if ms["is_open"]:
                 bh=fetch_bars(pair,"H4"); bm=fetch_bars(pair,"H1"); bl=fetch_bars(pair,"M15")
@@ -1638,19 +1377,12 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
       </div>
     </div>
 
-    <!-- Live Indicators Panel -->
+    <!-- ICT Context Panel -->
     <div class="sect" style="padding:.65rem 1rem">
-      <div class="slbl">Live Indicators</div>
+      <div class="slbl">ICT Context</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px">
-        <div class="lv"><div class="lvk">EMA200</div><div class="lvv" id="infoEMA" style="font-size:10px;color:var(--t2)">—</div></div>
-        <div class="lv"><div class="lvk">RSI(14)</div><div class="lvv" id="infoRSI" style="font-size:10px;color:var(--t2)">—</div></div>
-        <div class="lv"><div class="lvk">MACD</div><div class="lvv" id="infoMACD" style="font-size:10px;color:var(--t2)">—</div></div>
-        <div class="lv"><div class="lvk">BB %B</div><div class="lvv" id="infoBB" style="font-size:10px;color:var(--t2)">—</div></div>
-        <div class="lv"><div class="lvk">ATR Pips</div><div class="lvv" id="infoATR" style="font-size:10px;color:var(--t2)">—</div></div>
-        <div class="lv"><div class="lvk">Fib GP</div><div class="lvv" id="infoFib" style="font-size:10px;color:var(--t2)">—</div></div>
         <div class="lv" style="grid-column:span 2"><div class="lvk">Killzone</div><div class="lvv" id="infoKZ" style="font-size:10px;color:var(--t3)">None</div></div>
         <div class="lv" style="grid-column:span 2"><div class="lvk">Judas Swing</div><div class="lvv" id="infoJudas" style="font-size:10px;color:var(--t3)">None</div></div>
-        <div class="lv" style="grid-column:span 2"><div class="lvk">Candle Patterns</div><div class="lvv" id="infoCandles" style="font-size:9px;color:var(--t2)">—</div></div>
       </div>
     </div>
 
@@ -2078,58 +1810,11 @@ function updateSignal(sig){
   document.getElementById('tfH1').className='tf-trend '+trendCls(sig.mtf_trend||'ranging');
   document.getElementById('tfM15').textContent=trendLbl(sig.ltf_trend||'ranging');
   document.getElementById('tfM15').className='tf-trend '+trendCls(sig.ltf_trend||'ranging');
-  // New strategy indicators
-  const dp2=DIGITS[sig.pair]||5;
-  const ema200El=document.getElementById('infoEMA');
-  if(ema200El){
-    const abv=sig.ema_trend==='bullish';
-    ema200El.textContent='EMA200: '+(sig.ema200?sig.ema200.toFixed(dp2):'—')+' ('+(sig.ema_trend||'—').toUpperCase()+')';
-    ema200El.style.color=sig.ema_trend==='bullish'?'var(--g)':sig.ema_trend==='bearish'?'var(--r)':'var(--t2)';
-  }
-  const rsiEl=document.getElementById('infoRSI');
-  if(rsiEl){
-    const rval=sig.rsi||50;
-    rsiEl.textContent='RSI: '+rval.toFixed(1)+(sig.rsi_div?' ['+sig.rsi_div.toUpperCase()+' DIV]':'');
-    rsiEl.style.color=rval<30?'var(--g)':rval>70?'var(--r)':'var(--t2)';
-  }
+  // ICT context indicators (SMC + ICT only — no RSI/MACD/BB/ATR/Fib/Candle)
   const kzEl=document.getElementById('infoKZ');
   if(kzEl){kzEl.textContent=sig.killzone||'None';kzEl.style.color=sig.killzone?'var(--g)':'var(--t3)';}
   const judEl=document.getElementById('infoJudas');
   if(judEl){judEl.textContent=sig.judas?sig.judas.replace('_',' ').toUpperCase():'None';judEl.style.color=sig.judas?'var(--a)':'var(--t3)';}
-  // MACD
-  const macdEl=document.getElementById('infoMACD');
-  if(macdEl){
-    const h=sig.macd_hist||0;
-    macdEl.textContent=(sig.macd_div?sig.macd_div.toUpperCase()+' DIV':'')+(h>0?' ▲':h<0?' ▼':' —');
-    macdEl.style.color=h>0?'var(--g)':h<0?'var(--r)':'var(--t2)';
-  }
-  // Bollinger
-  const bbEl=document.getElementById('infoBB');
-  if(bbEl){
-    const pb=(sig.pct_b||0.5).toFixed(2);
-    bbEl.textContent=pb+(sig.bb_squeeze?' [SQUEEZE]':'');
-    bbEl.style.color=sig.bb_squeeze?'var(--a)':(sig.pct_b<0.1)?'var(--g)':(sig.pct_b>0.9)?'var(--r)':'var(--t2)';
-  }
-  // ATR
-  const atrEl=document.getElementById('infoATR');
-  if(atrEl){
-    const ap=sig.atr_pips||0;
-    atrEl.textContent=ap+'p (SL:'+sig.sl_pips+'p)';
-    atrEl.style.color=ap<20?'var(--g)':ap>50?'var(--r)':'var(--t2)';
-  }
-  // Fibonacci
-  const fibEl=document.getElementById('infoFib');
-  if(fibEl){
-    fibEl.textContent=sig.in_golden_pocket?'IN GOLDEN POCKET ✓':'Outside GP';
-    fibEl.style.color=sig.in_golden_pocket?'var(--a)':'var(--t3)';
-  }
-  // Candle patterns
-  const candEl=document.getElementById('infoCandles');
-  if(candEl){
-    const pats=sig.candle_patterns||[];
-    candEl.textContent=pats.length?pats.join(', '):'None detected';
-    candEl.style.color=pats.length?'var(--t)':'var(--t3)';
-  }
   // Confluence breakdown
   document.getElementById('bsBull').textContent='B:'+sig.buy_score+'%';
   document.getElementById('bsBear').textContent='S:'+sig.sell_score+'%';
@@ -2291,19 +1976,6 @@ function buildChart(p, bars, isDemo, tf){
       overlayLines.push({y:sig.sl,    color:'rgba(255,61,90,.9)',   dash:[5,3], width:1.5, label:'SL'});
       overlayLines.push({y:sig.tp1,   color:'rgba(0,255,179,.7)',   dash:[5,3], width:1.5, label:'TP1'});
       overlayLines.push({y:sig.tp2,   color:'rgba(0,255,179,.95)',  dash:[],    width:1.5, label:'TP2'});
-    }
-    // Bollinger bands
-    if(sig.bb_up && sig.bb_lo){
-      overlayLines.push({y:sig.bb_up, color:'rgba(255,184,0,.3)', dash:[2,4], width:1});
-      overlayLines.push({y:sig.bb_mid||((sig.bb_up+sig.bb_lo)/2), color:'rgba(255,184,0,.15)', dash:[2,4], width:1});
-      overlayLines.push({y:sig.bb_lo, color:'rgba(255,184,0,.3)', dash:[2,4], width:1});
-    }
-    // EMA lines
-    if(sig.ema200){
-      overlayLines.push({y:sig.ema200, color:'rgba(61,159,255,.5)', dash:[1,3], width:1, label:'EMA200'});
-    }
-    if(sig.ema50){
-      overlayLines.push({y:sig.ema50, color:'rgba(255,184,0,.45)', dash:[1,3], width:1, label:'EMA50'});
     }
   }
 
