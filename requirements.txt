@@ -4,3 +4,8 @@ yfinance
 pandas
 numpy
 gunicorn
+
+# ── Reinforcement learning (optional) ────────────────────────────────
+# Required only for the rl/ package: training and live RL policy.
+# Server runs fine without these — RL features auto-disable.
+torch>=2.0

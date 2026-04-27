@@ -23,6 +23,23 @@ except ImportError as e:
     print("Run:  pip install flask flask-cors yfinance pandas numpy\n")
     exit(1)
 
+# ── Reinforcement-learning policy (optional) ──────────────────────────
+# Controlled by env var USE_RL_POLICY (default off). When on, the trained
+# DQN in rl/weights/ acts as a confidence layer: it can downgrade or veto
+# the rule-based signal, but never invents trades the rule-based scorer
+# didn't already propose. If the rl package can't import (e.g. torch not
+# installed) we silently fall back to pure-rule mode.
+USE_RL_POLICY = os.environ.get("USE_RL_POLICY", "1") == "1"
+RL_VETO_THRESHOLD = float(os.environ.get("RL_VETO_THRESHOLD", "0.55"))  # softmax conf
+try:
+    from rl import policy as rl_policy           # type: ignore
+    from rl import online_trainer as rl_online   # type: ignore
+    RL_AVAILABLE = True
+except Exception as _e:
+    rl_policy = None
+    rl_online = None
+    RL_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO,
                     format="[%(asctime)s] %(message)s",
                     datefmt="%H:%M:%S")
@@ -584,6 +601,17 @@ def calc_limit_entry(direction, price, mtf, p, sl_pips):
     return price - offset if direction == "BUY" else price + offset
 
 
+def _rl_snapshot(htf, mtf, ltf):
+    """Trim analyse() outputs down to what rl.features.extract_state needs."""
+    keys = ("trend", "choch", "cd", "bos", "bd", "disc", "prem",
+            "tapped", "near", "breakers", "judas", "killzone",
+            "near_asian_hi", "near_asian_lo", "above_asian", "below_asian")
+    def _slim(d):
+        if not d: return {}
+        return {k: d.get(k) for k in keys if k in d}
+    return {"htf": _slim(htf), "mtf": _slim(mtf), "ltf": _slim(ltf)}
+
+
 def make_signal(pair, htf, mtf, ltf, bars=None):
     p=PIP.get(pair,0.0001); dp=DIGITS.get(pair,5); price=mtf.get("price",0)
     bs,bc=score(True, htf,mtf,ltf); ss,sc=score(False,htf,mtf,ltf)
@@ -707,6 +735,35 @@ def make_signal(pair, htf, mtf, ltf, bars=None):
         "Premium Zone":  0.10 if mtf.get("prem") else 0,
     }
     active_breakdown = bull_breakdown if direction=="BUY" else bear_breakdown
+
+    # ── RL policy overlay ─────────────────────────────────────────────
+    # Acts as a *gate*: the rule-based scorer proposes, the RL agent can
+    # confirm (boost score), demote (downgrade score), or veto (force WAIT).
+    # It never up-converts WAIT into a trade — that would mean firing a
+    # signal the SMC scorer didn't see.
+    rl_info = None
+    if USE_RL_POLICY and RL_AVAILABLE and rl_policy and rl_policy.is_available():
+        try:
+            decision = rl_policy.predict(htf, mtf, ltf, pair)
+            if decision is not None:
+                rl_info = decision.as_dict()
+                if direction in ("BUY", "SELL"):
+                    if decision.direction == "HOLD" and decision.confidence > RL_VETO_THRESHOLD:
+                        log.info(f"  {pair}: RL VETO ({decision.confidence:.2f} HOLD) — rule said {direction}")
+                        direction = "WAIT"
+                        conf.append(f"RL_veto({decision.confidence:.2f})")
+                    elif decision.direction == direction:
+                        # RL agrees — gentle score boost proportional to confidence
+                        boost = round(0.10 * decision.confidence, 3)
+                        sc_val = round(min(sc_val + boost, 1.0), 3)
+                        conf.append(f"RL_confirm({decision.confidence:.2f})")
+                    elif decision.direction in ("BUY", "SELL") and decision.direction != direction:
+                        # RL disagrees on direction — demote score
+                        sc_val = round(max(sc_val - 0.10, 0), 3)
+                        conf.append(f"RL_disagree({decision.direction})")
+        except Exception as e:
+            log.warning(f"  {pair}: RL overlay error: {e}")
+
     return {"pair":pair,"direction":direction,"score":sc_val,
             "score_pct":round(sc_val*100),"conf":conf,
             "entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"rr":rr,
@@ -746,7 +803,14 @@ def make_signal(pair, htf, mtf, ltf, bars=None):
             "pause_reason": pause_reason if paused else "",
             "daily_trade_count": _daily_trade_count.get(
                 f"{pair}_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}", 0
-            )}
+            ),
+            # RL overlay info (None unless USE_RL_POLICY=1 and weights present)
+            "rl": rl_info,
+            # Compact snapshots for the online trainer to reconstruct state
+            # at trade-close. Only the keys extract_state() actually reads
+            # are stored, so the signal dict stays small.
+            "_rl_snap": _rl_snapshot(htf, mtf, ltf) if (USE_RL_POLICY and RL_AVAILABLE) else None,
+            }
 
 def check_trade_outcomes(prices: dict):
     """
@@ -870,6 +934,24 @@ def check_trade_outcomes(prices: dict):
                      f"WR={_session_stats.get('win_rate',0)}% "
                      f"Net={_session_stats['net_pips']}p "
                      f"ConsecL={_session_stats['consecutive_losses']}")
+
+            # ── RL online fine-tuning ────────────────────────────────
+            # On terminal outcomes only (tp2 / sl). TP1 is a partial close;
+            # we wait for the final result before learning, so the reward
+            # the agent sees matches the env's reward shaping.
+            if (USE_RL_POLICY and RL_AVAILABLE and rl_online and
+                    outcome in ("tp2_hit", "sl_hit")):
+                try:
+                    cached = _signal_cache.get(pair, {})
+                    snap   = (cached or {}).get("_rl_snap") or {}
+                    rl_online.fine_tune_from_trade(
+                        completed,
+                        htf_snapshot=snap.get("htf"),
+                        mtf_snapshot=snap.get("mtf"),
+                        ltf_snapshot=snap.get("ltf"),
+                    )
+                except Exception as e:
+                    log.warning(f"  RL online tune skipped: {e}")
 
             # Update state — TP1 keeps signal alive (watching for TP2),
             # TP2 and SL both clear the signal → new signal allowed
@@ -1127,7 +1209,7 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SMC Signal Dashboard</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Bebas+Neue&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -1521,7 +1603,18 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
           <div style="font-family:var(--mono);font-size:8px;color:var(--t3)" id="cpxSrc">—</div>
         </div>
       </div>
-      <div class="chart-wrap"><canvas id="chart" role="img" aria-label="SMC price chart"></canvas></div>
+      <div class="chart-wrap" id="chartWrap">
+        <div id="chart" style="width:100%;height:100%;position:relative"></div>
+        <div id="ohlcReadout"
+             style="position:absolute;top:8px;left:10px;font-family:var(--mono);font-size:10px;color:var(--t2);pointer-events:none;z-index:5;line-height:1.5;background:rgba(5,8,11,.6);padding:4px 8px;border-radius:3px;border:1px solid var(--b);display:none">
+          <span id="ohlcDate" style="color:var(--t3);font-size:9px"></span><br>
+          <span style="color:var(--t3)">O</span> <span id="ohlcO">—</span>
+          <span style="color:var(--t3)">H</span> <span id="ohlcH">—</span>
+          <span style="color:var(--t3)">L</span> <span id="ohlcL">—</span>
+          <span style="color:var(--t3)">C</span> <span id="ohlcC">—</span>
+          <span style="color:var(--t3);margin-left:6px">V</span> <span id="ohlcV">—</span>
+        </div>
+      </div>
       <div style="display:flex;gap:12px;padding:3px 0;font-family:var(--mono);font-size:8px;color:var(--t3)">
         <span><span style="color:rgba(0,255,179,.9)">─</span> Entry</span>
         <span><span style="color:rgba(255,61,90,.9)">- -</span> SL</span>
@@ -1663,6 +1756,11 @@ async function loadPrices(){
       const el=document.getElementById('cpxChg');
       if(el){el.textContent=(chg>=0?'+':'')+chg.toFixed(dp)+' ('+(info.change_pct>=0?'+':'')+info.change_pct.toFixed(2)+'%)';
               el.style.color=chg>=0?'var(--g)':'var(--r)';}
+      // Live-tick the chart's last candle (TradingView-style bar pulsing)
+      if(typeof tickChart === 'function') tickChart(info.price);
+      // Also update the big price readout in the chart header
+      const cpx=document.getElementById('cpx');
+      if(cpx){ cpx.textContent = info.price.toFixed(dp); }
     }
   }catch(e){}
 }
@@ -1899,14 +1997,32 @@ async function loadChart(p, tf){
     if(d.bars&&d.bars.length) buildChart(p,d.bars,d.demo,tf);
   }catch(e){}
 }
-function buildChart(p, bars, isDemo, tf){
-  const dp   = DIGITS[p] || 5;
-  const sig  = allSigs.find(s => s.pair === p);
-  const canvas = document.getElementById('chart');
-  if(!canvas) return;
-  const ctx  = canvas.getContext('2d');
+// ── TradingView-style chart, powered by lightweight-charts ────────
+//
+// We keep the same global `chart` variable so the rest of the app
+// (switchTF, refresh) keeps working. `chart` is now a TradingView
+// IChartApi instead of a Chart.js instance, so we use chart.remove()
+// (not destroy) on rebuild. References:
+//   • https://tradingview.github.io/lightweight-charts/
+//   • Series API: chart.addCandlestickSeries / addHistogramSeries
+//   • Horizontal levels: series.createPriceLine({...})
+let _candleSeries = null;     // last candlestick series — used by crosshair
+let _resizeObs    = null;     // single observer reused across rebuilds
+let _lastBar      = null;     // last candle on the chart — patched by tickChart()
+let _chartPair    = null;     // which pair the current chart is showing
+let _chartTF      = null;     // and at which timeframe
 
-  // Update price display
+function _fmtPrice(v, dp){
+  return (v == null || isNaN(v)) ? '—' : Number(v).toFixed(dp);
+}
+
+function buildChart(p, bars, isDemo, tf){
+  const dp     = DIGITS[p] || 5;
+  const sig    = allSigs.find(s => s.pair === p);
+  const host   = document.getElementById('chart');
+  if(!host || !window.LightweightCharts) return;
+
+  // Header / price display ----------------------------------------------
   const last = bars[bars.length-1];
   if(last){
     document.getElementById('cpx').textContent = last.close.toFixed(dp);
@@ -1914,208 +2030,203 @@ function buildChart(p, bars, isDemo, tf){
   }
   const srcEl = document.getElementById('cpxSrc');
   if(srcEl) srcEl.textContent = (isDemo?'DEMO':'LIVE')+' · '+(tf||'H1')+' · yfinance';
-  // Update killzone display
-  const kz=getKillzoneLocal();
-  const kzEl=document.getElementById('cKZ');
+  const kz   = getKillzoneLocal();
+  const kzEl = document.getElementById('cKZ');
   if(kzEl){
     if(kz.name) kzEl.textContent='⚡ '+kz.name+' Killzone ACTIVE';
-    else kzEl.textContent=kz.next_in_mins?'Next KZ in '+kz.next_in_mins+'m':'';
+    else kzEl.textContent = kz.next_in_mins ? 'Next KZ in '+kz.next_in_mins+'m' : '';
   }
 
-  // Destroy previous Chart.js instance if exists
-  if(chart){ chart.destroy(); chart = null; }
+  // Tear down previous chart instance ----------------------------------
+  if(chart){ try{ chart.remove(); }catch(e){} chart = null; _candleSeries = null; }
+  if(_resizeObs){ try{ _resizeObs.disconnect(); }catch(e){} _resizeObs = null; }
+  // The chart library appends its own canvases — clear any stragglers.
+  while(host.firstChild) host.removeChild(host.firstChild);
 
-  // ── Canvas-based candlestick renderer ──────────────────────────────
-  // We draw candles directly on canvas via a Chart.js plugin for full control
-  const N = bars.length;
-  if(N < 2) return;
+  // Create chart -------------------------------------------------------
+  const LWC = window.LightweightCharts;
+  chart = LWC.createChart(host, {
+    width:  host.clientWidth  || 600,
+    height: host.clientHeight || 360,
+    layout: {
+      background: { type: 'solid', color: '#05080b' },
+      textColor:  '#6b8099',
+      fontFamily: 'JetBrains Mono, monospace',
+      fontSize:   10,
+    },
+    grid: {
+      vertLines: { color: 'rgba(255,255,255,.035)' },
+      horzLines: { color: 'rgba(255,255,255,.035)' },
+    },
+    timeScale: {
+      timeVisible:    true,
+      secondsVisible: false,
+      borderColor:    'rgba(255,255,255,.06)',
+      rightOffset:    6,
+      barSpacing:     8,
+    },
+    rightPriceScale: {
+      borderColor: 'rgba(255,255,255,.06)',
+      scaleMargins: { top: 0.06, bottom: 0.22 },  // leave room for volume pane
+    },
+    crosshair: {
+      mode: LWC.CrosshairMode.Normal,
+      vertLine: { color: 'rgba(255,255,255,.18)', width: 1, style: 3, labelBackgroundColor:'#111820' },
+      horzLine: { color: 'rgba(255,255,255,.18)', width: 1, style: 3, labelBackgroundColor:'#111820' },
+    },
+    handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
+    handleScale:  { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
+  });
 
-  // Price range with padding
-  const allH = bars.map(b=>b.high);
-  const allL = bars.map(b=>b.low);
-  let yMax = Math.max(...allH);
-  let yMin = Math.min(...allL);
+  // Candlestick series -------------------------------------------------
+  _candleSeries = chart.addCandlestickSeries({
+    upColor:        '#00ffb3',
+    downColor:      '#ff3d5a',
+    borderUpColor:  '#00ffb3',
+    borderDownColor:'#ff3d5a',
+    wickUpColor:    'rgba(0,255,179,.65)',
+    wickDownColor:  'rgba(255,61,90,.65)',
+    priceFormat:    { type:'price', precision: dp, minMove: Math.pow(10, -dp) },
+  });
 
-  // Include signal levels in range
-  if(sig && sig.direction !== 'WAIT'){
-    yMax = Math.max(yMax, sig.tp2 || 0);
-    yMin = Math.min(yMin, sig.sl  || yMin);
+  const candleData = bars.map(b => ({
+    time:  b.time,                          // unix seconds — lightweight-charts native
+    open:  +b.open,
+    high:  +b.high,
+    low:   +b.low,
+    close: +b.close,
+  }));
+  _candleSeries.setData(candleData);
+  // Track the most recent candle so loadPrices() ticks can patch it live
+  _lastBar   = candleData[candleData.length - 1] || null;
+  _chartPair = p;
+  _chartTF   = tf || _chartTF || 'H1';
+
+  // Volume histogram (bottom 18% of pane) ------------------------------
+  const volSeries = chart.addHistogramSeries({
+    color:        'rgba(107,128,153,.5)',
+    priceFormat:  { type: 'volume' },
+    priceScaleId: 'volume',
+  });
+  volSeries.priceScale().applyOptions({
+    scaleMargins: { top: 0.82, bottom: 0 },
+  });
+  volSeries.setData(bars.map(b => ({
+    time:  b.time,
+    value: +b.volume || 0,
+    color: (b.close >= b.open) ? 'rgba(0,255,179,.4)' : 'rgba(255,61,90,.4)',
+  })));
+
+  // ── Overlays: zones (OB / FVG / Breakers / Asian range) ───────────
+  // Each zone gets two parallel priceLines (top/bottom) on the candle
+  // series — same color, only the top carries a title. This gives a
+  // visual "box" on the price scale identical to how SMC traders mark
+  // OBs / FVGs in TradingView itself.
+  const PSTYLE = LWC.LineStyle;
+  function band(top, bot, color, title){
+    if(top != null) _candleSeries.createPriceLine({
+      price: +top, color, lineWidth: 1, lineStyle: PSTYLE.Dashed,
+      axisLabelVisible: true, title: title || '',
+    });
+    if(bot != null) _candleSeries.createPriceLine({
+      price: +bot, color, lineWidth: 1, lineStyle: PSTYLE.Dashed,
+      axisLabelVisible: false, title: '',
+    });
   }
-
-  const pad  = (yMax - yMin) * 0.08;
-  yMax += pad; yMin -= pad;
-
-  // Draw function helpers
-  function toY(price, h){ return h - ((price - yMin) / (yMax - yMin)) * h; }
-
-  // Build overlay lines dataset (zones, entry, SL, TP)
-  const overlayLines = [];
+  function level(price, color, title, style, width){
+    if(price == null) return;
+    _candleSeries.createPriceLine({
+      price: +price,
+      color,
+      lineWidth: width || 2,
+      lineStyle: style != null ? style : PSTYLE.Solid,
+      axisLabelVisible: true,
+      title: title || '',
+    });
+  }
 
   if(sig){
-    // OB zones
     (sig.zones || []).forEach(z => {
-      if(z.color === 'green' && z.hi && z.lo){
-        overlayLines.push({y: z.hi, color:'rgba(0,255,179,.5)', dash:[6,3], width:1, label:'OB'});
-        overlayLines.push({y: z.lo, color:'rgba(0,255,179,.25)', dash:[3,4], width:1});
-      }
-      if(z.color === 'red' && z.hi && z.lo){
-        overlayLines.push({y: z.hi, color:'rgba(255,61,90,.5)', dash:[6,3], width:1, label:'OB'});
-        overlayLines.push({y: z.lo, color:'rgba(255,61,90,.25)', dash:[3,4], width:1});
-      }
-      if(z.color === 'amber' && z.hi && z.lo){
-        const mid=(z.hi+z.lo)/2;
-        overlayLines.push({y: mid, color:'rgba(255,184,0,.5)', dash:[4,3], width:1, label:'FVG'});
-      }
-      if(z.color === 'blue' && z.price){
-        overlayLines.push({y: z.price, color:'rgba(61,159,255,.4)', dash:[4,4], width:1, label: z.type});
+      if(z.color === 'green' && z.hi && z.lo) band(z.hi, z.lo, 'rgba(0,255,179,.55)', 'Bull OB');
+      if(z.color === 'red'   && z.hi && z.lo) band(z.hi, z.lo, 'rgba(255,61,90,.55)', 'Bear OB');
+      if(z.color === 'amber' && z.hi && z.lo) band(z.hi, z.lo, 'rgba(255,184,0,.55)', 'FVG');
+      if(z.color === 'blue'  && z.price)      level(z.price, 'rgba(61,159,255,.55)', z.type, PSTYLE.Dotted, 1);
+      if((z.type||'').includes('Breaker') && z.hi && z.lo){
+        const c = (z.color === 'green') ? 'rgba(0,255,179,.45)' : 'rgba(255,61,90,.45)';
+        band(z.hi, z.lo, c, z.type);
       }
     });
-    // Signal levels
+
+    // Active trade levels — entry / SL / TP1 / TP2 with axis labels
     if(sig.direction !== 'WAIT'){
-      overlayLines.push({y:sig.entry, color:'rgba(61,159,255,.9)',  dash:[],    width:1.5, label:'Entry'});
-      overlayLines.push({y:sig.sl,    color:'rgba(255,61,90,.9)',   dash:[5,3], width:1.5, label:'SL'});
-      overlayLines.push({y:sig.tp1,   color:'rgba(0,255,179,.7)',   dash:[5,3], width:1.5, label:'TP1'});
-      overlayLines.push({y:sig.tp2,   color:'rgba(0,255,179,.95)',  dash:[],    width:1.5, label:'TP2'});
+      level(sig.entry, '#3d9fff',          'Entry ' + sig.direction, PSTYLE.Solid,  2);
+      level(sig.sl,    '#ff3d5a',          'SL',                     PSTYLE.Dashed, 2);
+      level(sig.tp1,   'rgba(0,255,179,.8)','TP1',                    PSTYLE.Dashed, 2);
+      level(sig.tp2,   '#00ffb3',          'TP2',                    PSTYLE.Solid,  2);
     }
   }
 
-  // Custom candlestick plugin
-  const candlePlugin = {
-    id: 'candles',
-    beforeDraw(chartInst){
-      const {ctx: c, chartArea: {left,right,top,bottom}, scales} = chartInst;
-      const W = right - left;
-      const H = bottom - top;
-      const candleW = Math.max(2, Math.floor(W / N * 0.7));
-      const gap     = W / N;
+  // Fit content + leave room on the right
+  chart.timeScale().fitContent();
 
-      c.save();
-      c.beginPath();
-      c.rect(left, top, W, H);
-      c.clip();
-
-      // Draw overlay lines behind candles
-      overlayLines.forEach(line => {
-        const ly = scales.y.getPixelForValue(line.y);
-        if(ly < top || ly > bottom) return;
-        c.beginPath();
-        c.strokeStyle = line.color;
-        c.lineWidth   = line.width || 1;
-        c.setLineDash(line.dash || []);
-        c.moveTo(left, ly);
-        c.lineTo(right, ly);
-        c.stroke();
-        // Label on right edge
-        if(line.label){
-          c.setLineDash([]);
-          c.fillStyle = line.color;
-          c.font = '9px JetBrains Mono, monospace';
-          c.textAlign = 'right';
-          c.fillText(line.label, right - 2, ly - 3);
-        }
-      });
-
-      // Draw candles
-      bars.forEach((b, i) => {
-        const x  = left + i * gap + gap / 2;
-        const yO = scales.y.getPixelForValue(b.open);
-        const yC = scales.y.getPixelForValue(b.close);
-        const yH = scales.y.getPixelForValue(b.high);
-        const yL = scales.y.getPixelForValue(b.low);
-        const isBull = b.close >= b.open;
-        const col    = isBull ? '#00ffb3' : '#ff3d5a';
-        const bodyTop    = Math.min(yO, yC);
-        const bodyBottom = Math.max(yO, yC);
-        const bodyH      = Math.max(1, bodyBottom - bodyTop);
-
-        // Wick
-        c.beginPath();
-        c.strokeStyle = isBull ? 'rgba(0,255,179,.6)' : 'rgba(255,61,90,.6)';
-        c.lineWidth = 1;
-        c.setLineDash([]);
-        c.moveTo(x, yH);
-        c.lineTo(x, yL);
-        c.stroke();
-
-        // Body
-        c.fillStyle = isBull ? 'rgba(0,255,179,.85)' : 'rgba(255,61,90,.85)';
-        c.strokeStyle = col;
-        c.lineWidth = 0.5;
-        c.beginPath();
-        c.rect(x - candleW/2, bodyTop, candleW, bodyH);
-        c.fill();
-        c.stroke();
-      });
-
-      // ── Volume bars at bottom (10% of chart height) ──────────────
-      const volH   = H * 0.12;
-      const volTop = bottom - volH;
-      const vols   = bars.map(b=>b.volume||0);
-      const maxVol = Math.max(...vols, 1);
-      c.globalAlpha = 0.45;
-      bars.forEach((b,i)=>{
-        const x   = left + i*gap + gap/2;
-        const vh  = (b.volume||0) / maxVol * volH;
-        const col = b.close >= b.open ? 'rgba(0,255,179,.6)' : 'rgba(255,61,90,.6)';
-        c.fillStyle = col;
-        c.fillRect(x - candleW/2, volTop + volH - vh, candleW, vh);
-      });
-      c.globalAlpha = 1.0;
-
-      // Volume axis label
-      c.fillStyle = '#2d404f';
-      c.font = '8px JetBrains Mono, monospace';
-      c.textAlign = 'left';
-      c.fillText('Vol', left + 2, volTop + 10);
-
-      c.restore();
+  // ── Crosshair → OHLC readout (TradingView-style data window) ──────
+  const ro = document.getElementById('ohlcReadout');
+  const elDate = document.getElementById('ohlcDate');
+  const elO = document.getElementById('ohlcO');
+  const elH = document.getElementById('ohlcH');
+  const elL = document.getElementById('ohlcL');
+  const elC = document.getElementById('ohlcC');
+  const elV = document.getElementById('ohlcV');
+  // Map time → bar for O(1) volume lookup
+  const byTime = Object.create(null);
+  bars.forEach(b => { byTime[b.time] = b; });
+  chart.subscribeCrosshairMove(param => {
+    if(!param || !param.time || !param.seriesData || !ro){
+      if(ro) ro.style.display = 'none';
+      return;
     }
-  };
-
-  // Invisible dataset to set up the axes
-  const pricePoints = bars.map((b,i) => ({x: i, y: (b.high+b.low)/2}));
-
-  chart = new Chart(canvas, {
-    type: 'scatter',
-    data: {
-      datasets: [{
-        data: pricePoints,
-        pointRadius: 0,
-        showLine: false,
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: { duration: 0 },
-      plugins: {
-        legend:  { display: false },
-        tooltip: { enabled: false },
-        candles: {},
-      },
-      scales: {
-        x: {
-          type: 'linear',
-          display: false,
-          min: 0,
-          max: N - 1,
-        },
-        y: {
-          min: yMin,
-          max: yMax,
-          grid: { color: 'rgba(255,255,255,.04)', lineWidth: 0.5 },
-          border: { color: 'rgba(255,255,255,.06)' },
-          ticks: {
-            color: '#2d404f',
-            font: { size: 9, family: 'JetBrains Mono, monospace' },
-            maxTicksLimit: 6,
-            callback: v => typeof v === 'number' ? v.toFixed(dp > 3 ? 4 : dp < 3 ? 1 : 2) : v,
-          }
-        }
-      }
-    },
-    plugins: [candlePlugin]
+    const candle = param.seriesData.get(_candleSeries);
+    if(!candle){ ro.style.display = 'none'; return; }
+    ro.style.display = 'block';
+    const b = byTime[param.time];
+    elO.textContent = _fmtPrice(candle.open,  dp);
+    elH.textContent = _fmtPrice(candle.high,  dp);
+    elL.textContent = _fmtPrice(candle.low,   dp);
+    elC.textContent = _fmtPrice(candle.close, dp);
+    elV.textContent = b ? (b.volume||0).toLocaleString() : '—';
+    if(elDate){
+      const ts = new Date(param.time * 1000);
+      elDate.textContent = ts.toISOString().replace('T',' ').substring(0,16) + ' UTC';
+    }
+    // Color the close green/red vs open
+    elC.style.color = (candle.close >= candle.open) ? '#00ffb3' : '#ff3d5a';
   });
+
+  // ── Resize handling ───────────────────────────────────────────────
+  _resizeObs = new ResizeObserver(entries => {
+    for(const e of entries){
+      const w = Math.floor(e.contentRect.width);
+      const h = Math.floor(e.contentRect.height);
+      if(w > 0 && h > 0 && chart){
+        chart.applyOptions({ width: w, height: h });
+      }
+    }
+  });
+  _resizeObs.observe(host);
+}
+
+// ── Live last-candle tick ──────────────────────────────────────────
+// Called every time loadPrices() pulls a fresh quote for the current
+// pair. Extends the latest candle's high/low and snaps its close to
+// the new price — the same "real-time bar" behaviour TradingView shows.
+function tickChart(price){
+  if(!_candleSeries || !_lastBar || price == null || isNaN(price)) return;
+  const px = +price;
+  // Mutate in place so the next tick keeps extending from the running bar
+  if(px > _lastBar.high) _lastBar.high = px;
+  if(px < _lastBar.low)  _lastBar.low  = px;
+  _lastBar.close = px;
+  try{ _candleSeries.update(_lastBar); }catch(e){}
 }
 
 
@@ -2411,7 +2522,10 @@ function sendPushNotif(title, body){
   pollStats();
 })();
 setInterval(checkStatus,60000);
-setInterval(loadPrices,60000);
+// Faster price polling so the chart's last candle pulses in near-real-time
+setInterval(loadPrices,10000);
+// Periodic full-bar refresh so new candles appear as they close on yfinance
+setInterval(()=>{ if(pair) loadChart(pair); }, 60000);
 </script>
 </body>
 </html>
@@ -2459,5 +2573,23 @@ if __name__ == "__main__":
     # Start auto-scan background thread
     scanner = threading.Thread(target=auto_scan_loop, daemon=True)
     scanner.start()
+
+    # Start RL auto-loop (bootstrap if no weights yet, then retrain
+    # daily). Skips silently if torch/rl aren't importable.
+    if RL_AVAILABLE:
+        try:
+            from rl.auto_loop import start as _rl_auto_start
+            _rl_auto_start(interval_hours=float(os.environ.get("RL_RETRAIN_HOURS", "24")))
+        except Exception as _e:
+            log.warning(f"RL auto-loop not started: {_e}")
+
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+# daily). Skips silently if torch/rl aren't importable.
+    if RL_AVAILABLE:
+        try:
+            from rl.auto_loop import start as _rl_auto_start
+            _rl_auto_start(interval_hours=float(os.environ.get("RL_RETRAIN_HOURS", "24")))
+        except Exception as _e:
+            log.warning(f"RL auto-loop not started: {_e}")
 
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

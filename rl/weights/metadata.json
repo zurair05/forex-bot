@@ -1,0 +1,18 @@
+{
+  "config": {
+    "state_dim": 35,
+    "action_dim": 5,
+    "hidden": 64,
+    "lr": 0.001,
+    "gamma": 0.95,
+    "batch_size": 64,
+    "buffer_size": 50000,
+    "target_sync": 500,
+    "epsilon_start": 1.0,
+    "epsilon_end": 0.05,
+    "epsilon_decay": 20000,
+    "grad_clip": 1.0,
+    "seed": 42
+  },
+  "steps_done": 11572
+}
