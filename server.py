@@ -40,6 +40,31 @@ except Exception as _e:
     rl_online = None
     RL_AVAILABLE = False
 
+# ── OANDA data source (preferred over yfinance when configured) ───────
+# Set OANDA_API_KEY + OANDA_ACCOUNT_ID env vars to use OANDA's free demo
+# feed (cleaner data, real bid/ask spreads). Otherwise fall back silently
+# to yfinance — no breakage for existing setups.
+try:
+    import oanda_data as _oanda                  # type: ignore
+except Exception as _e:
+    _oanda = None
+
+# ── Persistence + indicators + news filter ────────────────────────────
+# Three lightweight helpers that upgrade the bot's accuracy:
+#   db           — SQLite store for signal history & daily stats
+#   indicators   — ATR-based SL sizing + per-pair spread modeling
+#   news_filter  — blocks signals around high-impact economic events
+try:
+    import db                                    # type: ignore
+    import indicators                            # type: ignore
+    import news_filter                           # type: ignore
+    EXTRAS_AVAILABLE = True
+except Exception as _e:
+    db = None
+    indicators = None
+    news_filter = None
+    EXTRAS_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO,
                     format="[%(asctime)s] %(message)s",
                     datefmt="%H:%M:%S")
@@ -118,36 +143,82 @@ def market_status():
 
 # ── Data fetching ─────────────────────────────────────────────────────
 def fetch_bars(pair, tf="H1"):
+    """
+    Returns OHLCV bars for `pair` at timeframe `tf`.
+
+    Source preference: OANDA (if API key configured) → yfinance → None.
+    OANDA is the cleaner feed; yfinance is the fallback so existing
+    setups without a token keep working.
+    """
     key = f"{pair}_{tf}"
-    if key in _bar_cache and time.time()-_bar_cache[key]["ts"] < BAR_TTL:
+    if key in _bar_cache and time.time() - _bar_cache[key]["ts"] < BAR_TTL:
         return _bar_cache[key]["data"]
-    ticker   = PAIRS.get(pair)
-    interval = {"M15":"15m","H1":"1h","H4":"4h","D1":"1d"}.get(tf,"1h")
-    period   = {"M15":"5d", "H1":"30d","H4":"60d","D1":"1y"}.get(tf,"30d")
-    try:
-        df = yf.download(ticker, interval=interval, period=period,
-                         progress=False, auto_adjust=True)
-        if df is None or df.empty: return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.dropna()
-        bars = [{"time":int(pd.Timestamp(ts).timestamp()),
-                 "open":float(r["Open"]),"high":float(r["High"]),
-                 "low":float(r["Low"]),"close":float(r["Close"]),
-                 "volume":int(r.get("Volume",0))}
-                for ts,r in df.iterrows()]
-        _bar_cache[key] = {"data":bars,"ts":time.time()}
-        return bars
-    except Exception as e:
-        log.warning(f"Fetch {pair} {tf}: {e}")
-        return None
+
+    bars = None
+    # Primary: OANDA
+    if _oanda and _oanda.is_configured():
+        try:
+            bars = _oanda.fetch_bars(pair, tf)
+        except Exception as e:
+            log.warning(f"OANDA fetch_bars({pair},{tf}) error: {e}")
+
+    # Fallback: yfinance
+    if not bars:
+        ticker   = PAIRS.get(pair)
+        interval = {"M15":"15m","H1":"1h","H4":"4h","D1":"1d"}.get(tf,"1h")
+        period   = {"M15":"5d", "H1":"30d","H4":"60d","D1":"1y"}.get(tf,"30d")
+        try:
+            df = yf.download(ticker, interval=interval, period=period,
+                             progress=False, auto_adjust=True)
+            if df is None or df.empty: return None
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.dropna()
+            bars = [{"time":int(pd.Timestamp(ts).timestamp()),
+                     "open":float(r["Open"]),"high":float(r["High"]),
+                     "low":float(r["Low"]),"close":float(r["Close"]),
+                     "volume":int(r.get("Volume",0))}
+                    for ts,r in df.iterrows()]
+        except Exception as e:
+            log.warning(f"yfinance fetch_bars({pair},{tf}) error: {e}")
+            return None
+
+    if bars:
+        _bar_cache[key] = {"data": bars, "ts": time.time()}
+    return bars
 
 def fetch_prices():
+    """
+    Returns {pair: {price, day_high, day_low, prev_close, change_pct,
+                     change_abs[, bid, ask, spread_abs, spread_pips]}}
+
+    OANDA is preferred — it returns real bid/ask so we can surface
+    "spread cost" on every signal. Falls back to yfinance otherwise.
+    """
     global _price_cache, _price_ts
-    if _price_cache and time.time()-_price_ts < PRICE_TTL:
+    if _price_cache and time.time() - _price_ts < PRICE_TTL:
         return _price_cache
+
     out = {}
-    for pair, ticker in PAIRS.items():
+
+    # Primary: OANDA (one batched call gives all pairs)
+    if _oanda and _oanda.is_configured():
+        try:
+            o = _oanda.fetch_prices(list(PAIRS.keys()))
+            if o:
+                # Add per-pair spread in pips so the dashboard can show it
+                for pair, info in o.items():
+                    p = PIP.get(pair, 0.0001)
+                    if p > 0 and "spread_abs" in info:
+                        info["spread_pips"] = round(info["spread_abs"] / p, 2)
+                out.update(o)
+        except Exception as e:
+            log.warning(f"OANDA fetch_prices error: {e}")
+
+    # Fallback: yfinance — fills any pair OANDA didn't return
+    missing = [p for p in PAIRS if p not in out]
+    for pair in missing:
+        ticker = PAIRS[pair]
         try:
             df = yf.download(ticker, period="2d", interval="1h",
                              progress=False, auto_adjust=True)
@@ -156,21 +227,23 @@ def fetch_prices():
                 df.columns = df.columns.get_level_values(0)
             df = df.dropna()
             if df.empty: continue
-            last = df.iloc[-1]; prev = df.iloc[-2] if len(df)>1 else last
-            close_price = round(float(last["Close"]),5)
-            prev_close  = round(float(prev["Close"]),5)
-            day_high    = round(float(last["High"]),5)
-            day_low     = round(float(last["Low"]),5)
+            last = df.iloc[-1]; prev = df.iloc[-2] if len(df) > 1 else last
+            close_price = round(float(last["Close"]), 5)
+            prev_close  = round(float(prev["Close"]), 5)
             out[pair] = {
                 "price":      close_price,
-                "day_high":   day_high,
-                "day_low":    day_low,
+                "day_high":   round(float(last["High"]), 5),
+                "day_low":    round(float(last["Low"]),  5),
                 "prev_close": prev_close,
-                "change_pct": round((close_price-prev_close)/prev_close*100,3) if prev_close!=0 else 0,
-                "change_abs": round(close_price-prev_close, 5),
+                "change_pct": round((close_price - prev_close) / prev_close * 100, 3) if prev_close else 0,
+                "change_abs": round(close_price - prev_close, 5),
             }
-        except: pass
-    if out: _price_cache=out; _price_ts=time.time()
+        except Exception:
+            pass
+
+    if out:
+        _price_cache = out
+        _price_ts    = time.time()
     return out
 
 def demo_bars(pair, n=120):
@@ -384,6 +457,54 @@ def detect_breakers(bars, pip=0.0001):
     return breakers[-4:]
 
 
+# ── Sequence-aware: Sweep → CHoCH ─────────────────────────────────────
+def detect_sweep_then_choch(rev_bars, lookback=25, follow_window=10):
+    """
+    SMC-correct ordering: a liquidity sweep should happen BEFORE the
+    structure shift, not after. Currently the additive score gives the
+    same weight regardless of ordering. This detector returns True only
+    when the sweep precedes the CHoCH within `follow_window` bars.
+
+    rev_bars is the reversed-bars list used elsewhere in analyse() —
+    index 0 = most recent.
+
+    Returns (bull_pattern, bear_pattern).
+    """
+    n = min(lookback, len(rev_bars) - 6) if rev_bars else 0
+    if n < 8:
+        return False, False
+    bull = bear = False
+    # Walk from older bars to newer ones (high idx → low idx in reversed list)
+    for i in range(n - 1, 4, -1):
+        b = rev_bars[i]
+        # Reference range immediately after the candidate (newer bars)
+        ref_lo = min(x["low"]  for x in rev_bars[max(i-5,0):i])
+        ref_hi = max(x["high"] for x in rev_bars[max(i-5,0):i])
+        # Bull sweep: bar i poked below a recent low and closed back above it
+        if not bull and b["low"] < ref_lo and b["close"] > ref_lo:
+            end = max(i - follow_window, 0)
+            for j in range(i - 1, end - 1, -1):
+                seg = rev_bars[j + 1:i]
+                if not seg: continue
+                broken_hi = max(x["high"] for x in seg)
+                if rev_bars[j]["close"] > broken_hi:
+                    bull = True
+                    break
+        # Bear sweep mirror
+        if not bear and b["high"] > ref_hi and b["close"] < ref_hi:
+            end = max(i - follow_window, 0)
+            for j in range(i - 1, end - 1, -1):
+                seg = rev_bars[j + 1:i]
+                if not seg: continue
+                broken_lo = min(x["low"] for x in seg)
+                if rev_bars[j]["close"] < broken_lo:
+                    bear = True
+                    break
+        if bull and bear:
+            break
+    return bull, bear
+
+
 # ── Strategy 6: Judas Swing Detection ─────────────────────────────────
 def detect_judas_swing(bars, asian_range, pip=0.0001):
     """
@@ -438,6 +559,8 @@ def analyse(bars, pair):
     asian_range = get_asian_range(bars)
     judas       = detect_judas_swing(rev, asian_range, p)
     kz          = get_killzone()
+    # Sequence-aware: sweep → CHoCH ordering bonus
+    seq_bull, seq_bear = detect_sweep_then_choch(rev)
 
     # Asian range position
     near_asian_hi = asian_range and abs(price - asian_range["hi"]) / p < 20
@@ -456,6 +579,7 @@ def analyse(bars, pair):
             "near_asian_hi":near_asian_hi,"near_asian_lo":near_asian_lo,
             "above_asian":above_asian,"below_asian":below_asian,
             "judas":judas,"killzone":kz,
+            "seq_bull":seq_bull,"seq_bear":seq_bear,
             "ob_count":len(obs),"fvg_count":len(fvgs),
             "swing_count":len(sw)}
 
@@ -503,6 +627,10 @@ def score(buy, htf, mtf, ltf):
     breakers = mtf.get("breakers", [])
     if buy  and any(b["bull"] for b in breakers): s+=0.12;c.append("Breaker↑")
     if not buy and any(not b["bull"] for b in breakers): s+=0.12;c.append("Breaker↓")
+
+    # ── Sequence bonus: sweep BEFORE CHoCH (SMC-correct ordering) ─────
+    if buy  and mtf.get("seq_bull"): s+=0.12;c.append("Sweep→CHoCH↑")
+    if not buy and mtf.get("seq_bear"): s+=0.12;c.append("Sweep→CHoCH↓")
 
     return round(min(s,1.0),3),c
 
@@ -657,9 +785,29 @@ def make_signal(pair, htf, mtf, ltf, bars=None):
         if sc_val <= 0.70:
             direction = "WAIT"
             log.info(f"  {pair}: dropped to WAIT after correlation penalty")
-    # Fixed 30-pip SL (classic SMC default — no ATR auto-sizing)
-    sl_pips = 30
-    sl_d    = p * sl_pips
+    # ── ATR-based SL ─────────────────────────────────────────────────
+    # Replaces the old fixed 30-pip SL. Pulls Wilder ATR(14) from the
+    # entry-timeframe bars, multiplies by 1.2, clamps to per-pair
+    # min/max bounds. Falls back to 30 pips if ATR can't be computed
+    # (too few bars). XAUUSD ends up with ~80-150p SL, EURUSD ~15-25p.
+    if EXTRAS_AVAILABLE and indicators and bars:
+        sl_pips = indicators.atr_sl_pips(bars, pair, p)
+    else:
+        sl_pips = 30
+    sl_d = p * sl_pips
+
+    # ── News blackout ───────────────────────────────────────────────
+    # Veto signal if a HIGH-impact event for one of this pair's
+    # currencies is within ±30 minutes. SMC theory says skip news.
+    if direction != "WAIT" and EXTRAS_AVAILABLE and news_filter:
+        try:
+            blocked, reason = news_filter.is_blocked(pair)
+            if blocked:
+                log.info(f"  {pair}: NEWS BLOCK — {reason}")
+                direction = "WAIT"
+                conf = list(conf) + [f"News:{reason[:32]}"]
+        except Exception as _e:
+            pass
 
     # ── Realistic limit entry (NOT current market price) ─────────────────
     # Previously: entry = round(price, dp), which meant every signal "started"
@@ -848,16 +996,35 @@ def check_trade_outcomes(prices: dict):
                 _trade_state.pop(pair, None)
                 _signal_cache.pop(pair, None)
                 continue
-            # Fill if price reaches entry
-            filled = (direction == "BUY"  and cur <= entry) or \
-                     (direction == "SELL" and cur >= entry)
-            if filled:
+            # ── Confirmation-candle gating ───────────────────────
+            # First touch of the limit zone arms the signal but DOESN'T
+            # fill. We need to see price react (bounce in trade
+            # direction) on a subsequent poll before entering. If price
+            # instead pushes further against the setup we cancel — the
+            # zone failed to hold. Cuts a lot of "knife-catch" fills.
+            touched = (direction == "BUY"  and cur <= entry) or \
+                      (direction == "SELL" and cur >= entry)
+
+            if not state.get("armed"):
+                if touched:
+                    state["armed"]      = True
+                    state["armed_at"]   = cur
+                    log.info(f"  {pair}: PENDING ARMED @ {cur} (waiting for confirmation)")
+                continue   # never fill on the same poll as first touch
+
+            # Already armed — decide on this poll. Failed-setup case
+            # (price ran past SL while armed) is handled by the
+            # `invalidated` check at the top of the PENDING block.
+            armed_at = state.get("armed_at", entry)
+            confirmed = (direction == "BUY"  and cur > entry) or \
+                        (direction == "SELL" and cur < entry)
+            if confirmed:
                 state["status"]    = "active"
                 state["filled_at"] = datetime.now(timezone.utc).isoformat()
-                log.info(f"  {pair}: Limit FILLED @ {entry} — now ACTIVE "
-                         f"(SL={sl} TP1={tp1} TP2={tp2})")
+                log.info(f"  {pair}: Limit FILLED @ {entry} "
+                         f"(confirmed rejection from {armed_at})")
             else:
-                # still pending, nothing else to do
+                # Still in zone, no rejection yet — keep waiting
                 continue
 
         outcome   = None
@@ -887,21 +1054,37 @@ def check_trade_outcomes(prices: dict):
         if outcome:
             dp  = DIGITS.get(pair, 5)
             p   = PIP.get(pair, 0.0001)
-            pnl_pips = (hit_price - entry) / p if direction == "BUY" else (entry - hit_price) / p
-            pnl_pips = round(pnl_pips, 1)
+            raw_pnl  = (hit_price - entry) / p if direction == "BUY" else (entry - hit_price) / p
+
+            # ── Spread cost ──────────────────────────────────────────
+            # Subtract the broker's drag (entry + exit). Live OANDA
+            # spread preferred; falls back to per-pair default.
+            live_sp = None
+            try:
+                live_sp = (prices.get(pair) or {}).get("spread_pips")
+            except Exception:
+                pass
+            sp_pips = (indicators.spread_pips(pair, live_sp)
+                       if EXTRAS_AVAILABLE and indicators else 1.0)
+            pnl_pips = round(raw_pnl - sp_pips, 1)
 
             log.info(f"  {pair} {outcome.upper()}: entry={entry} hit={hit_price:.{dp}f} "
-                     f"pnl={pnl_pips:+.1f}pips")
+                     f"raw={raw_pnl:+.1f}p spread={sp_pips:.1f}p net={pnl_pips:+.1f}p")
 
             # Record in history
             completed = {**state,
-                "status":    outcome,
-                "hit_price": round(hit_price, dp),
-                "hit_at":    datetime.now(timezone.utc).isoformat(),
-                "pnl_pips":  pnl_pips,
-                "result":    "win" if "tp" in outcome else "loss"}
+                "status":      outcome,
+                "hit_price":   round(hit_price, dp),
+                "hit_at":      datetime.now(timezone.utc).isoformat(),
+                "pnl_pips":    pnl_pips,
+                "spread_pips": sp_pips,
+                "result":      "win" if "tp" in outcome else "loss"}
             _signal_history.insert(0, completed)
-            # No cap on history — keep all completed trades
+
+            # ── Persist to SQLite ──────────────────────────────────
+            if EXTRAS_AVAILABLE and db:
+                try: db.insert_signal(completed)
+                except Exception as _e: log.warning(f"  DB persist failed: {_e}")
 
             # Update session stats
             global _daily_drawdown_pips
@@ -934,6 +1117,25 @@ def check_trade_outcomes(prices: dict):
                      f"WR={_session_stats.get('win_rate',0)}% "
                      f"Net={_session_stats['net_pips']}p "
                      f"ConsecL={_session_stats['consecutive_losses']}")
+
+            # Persist daily stats snapshot
+            if EXTRAS_AVAILABLE and db:
+                try:
+                    db.upsert_session_stats(today, {
+                        "total":            _session_stats["total"],
+                        "wins":             _session_stats["wins"],
+                        "losses":           _session_stats["losses"],
+                        "net_pips":         _session_stats["net_pips"],
+                        "consecutive_loss": _session_stats["consecutive_losses"],
+                        "daily_pnl_pips":   _session_stats["daily_pnl_pips"],
+                        "best_trade_pips":  _session_stats["best_trade_pips"],
+                        "worst_trade_pips": _session_stats["worst_trade_pips"],
+                        "total_pips_won":   _session_stats["total_pips_won"],
+                        "total_pips_lost":  _session_stats["total_pips_lost"],
+                        "updated_at":       datetime.now(timezone.utc).isoformat(),
+                    })
+                except Exception as _e:
+                    log.warning(f"  DB stats persist failed: {_e}")
 
             # ── RL online fine-tuning ────────────────────────────────
             # On terminal outcomes only (tp2 / sl). TP1 is a partial close;
@@ -2570,21 +2772,36 @@ if __name__ == "__main__":
     t = threading.Thread(target=open_browser, daemon=True)
     t.start()
 
+    # ── Hydrate persistence layer ─────────────────────────────────
+    if EXTRAS_AVAILABLE and db:
+        try:
+            db.init()
+            hist = db.load_recent_signals(500)
+            if hist:
+                _signal_history.extend(hist)
+                log.info(f"DB: hydrated {len(hist)} signals from disk")
+            today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            today_row = db.load_today_stats(today_key)
+            if today_row:
+                for k in ("total","wins","losses","net_pips","daily_pnl_pips",
+                          "best_trade_pips","worst_trade_pips",
+                          "total_pips_won","total_pips_lost"):
+                    if k in today_row and today_row[k] is not None:
+                        _session_stats[k] = today_row[k]
+                if today_row.get("consecutive_loss") is not None:
+                    _session_stats["consecutive_losses"] = today_row["consecutive_loss"]
+                _session_stats["win_rate"] = round(
+                    _session_stats["wins"] / max(_session_stats["total"], 1) * 100)
+                log.info(f"DB: restored today's stats — {_session_stats['wins']}W/{_session_stats['losses']}L")
+        except Exception as _e:
+            log.warning(f"DB hydration failed: {_e}")
+
     # Start auto-scan background thread
     scanner = threading.Thread(target=auto_scan_loop, daemon=True)
     scanner.start()
 
     # Start RL auto-loop (bootstrap if no weights yet, then retrain
     # daily). Skips silently if torch/rl aren't importable.
-    if RL_AVAILABLE:
-        try:
-            from rl.auto_loop import start as _rl_auto_start
-            _rl_auto_start(interval_hours=float(os.environ.get("RL_RETRAIN_HOURS", "24")))
-        except Exception as _e:
-            log.warning(f"RL auto-loop not started: {_e}")
-
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
-# daily). Skips silently if torch/rl aren't importable.
     if RL_AVAILABLE:
         try:
             from rl.auto_loop import start as _rl_auto_start

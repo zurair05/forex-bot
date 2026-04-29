@@ -4,6 +4,7 @@ yfinance
 pandas
 numpy
 gunicorn
+requests
 
 # ── Reinforcement learning (optional) ────────────────────────────────
 # Required only for the rl/ package: training and live RL policy.
